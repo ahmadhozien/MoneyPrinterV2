@@ -5,6 +5,7 @@ import time
 import os
 import requests
 import assemblyai as aai
+import subprocess
 
 from utils import *
 from cache import *
@@ -31,6 +32,11 @@ from datetime import datetime
 # Set ImageMagick Path
 change_settings({"IMAGEMAGICK_BINARY": get_imagemagick_path()})
 
+MIN_IMAGE_PROMPTS = 5
+MAX_IMAGE_PROMPTS = 8
+IMAGE_RATE_LIMIT_RETRIES = 3
+IMAGE_RATE_LIMIT_BACKOFF_SECONDS = 5
+
 
 class YouTube:
     """
@@ -54,6 +60,8 @@ class YouTube:
         fp_profile_path: str,
         niche: str,
         language: str,
+        character_context: str = "",
+        open_browser: bool = True,
     ) -> None:
         """
         Constructor for YouTube Class.
@@ -73,6 +81,8 @@ class YouTube:
         self._fp_profile_path: str = fp_profile_path
         self._niche: str = niche
         self._language: str = language
+        self._character_context: str = character_context.strip()
+        self.browser: webdriver.Firefox | None = None
 
         self.images = []
 
@@ -83,21 +93,55 @@ class YouTube:
         if get_headless():
             self.options.add_argument("--headless")
 
-        if not os.path.isdir(self._fp_profile_path):
-            raise ValueError(
-                f"Firefox profile path does not exist or is not a directory: {self._fp_profile_path}"
+        if open_browser:
+            if not os.path.isdir(self._fp_profile_path):
+                raise ValueError(
+                    f"Firefox profile path does not exist or is not a directory: {self._fp_profile_path}"
+                )
+
+            self._assert_profile_is_available(self._fp_profile_path)
+
+            self.options.add_argument("-profile")
+            self.options.add_argument(self._fp_profile_path)
+
+            # Set the service
+            self.service: Service = Service(GeckoDriverManager().install())
+
+            # Initialize the browser
+            self.browser = webdriver.Firefox(
+                service=self.service, options=self.options
             )
 
-        self.options.add_argument("-profile")
-        self.options.add_argument(self._fp_profile_path)
+    def _assert_profile_is_available(self, profile_path: str) -> None:
+        """
+        Ensures the Firefox profile is not currently locked by another running
+        Firefox process before Selenium tries to launch it.
 
-        # Set the service
-        self.service: Service = Service(GeckoDriverManager().install())
+        Args:
+            profile_path (str): Firefox profile folder
 
-        # Initialize the browser
-        self.browser: webdriver.Firefox = webdriver.Firefox(
-            service=self.service, options=self.options
-        )
+        Returns:
+            None
+        """
+        lock_path = os.path.join(profile_path, "parent.lock")
+        if not os.path.exists(lock_path):
+            return
+
+        try:
+            result = subprocess.run(
+                ["tasklist", "/FI", "IMAGENAME eq firefox.exe"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            firefox_running = "firefox.exe" in result.stdout.lower()
+        except Exception:
+            firefox_running = True
+
+        if firefox_running:
+            raise RuntimeError(
+                "The selected Firefox profile is currently in use. Close Firefox completely and try again."
+            )
 
     @property
     def niche(self) -> str:
@@ -131,6 +175,22 @@ class YouTube:
         """
         return generate_text(prompt, model_name=model_name)
 
+    def _get_character_context_block(self) -> str:
+        """
+        Returns an optional prompt block that keeps generations aligned with
+        the account's persistent character and voice.
+
+        Returns:
+            block (str): prompt block or empty string
+        """
+        if not self._character_context:
+            return ""
+
+        return (
+            f"Channel character context: {self._character_context}\n"
+            "Keep the topic, script, visuals, and metadata aligned with this channel identity.\n"
+        )
+
     def generate_topic(self) -> str:
         """
         Generates a topic based on the YouTube Channel niche.
@@ -139,7 +199,9 @@ class YouTube:
             topic (str): The generated topic.
         """
         completion = self.generate_response(
-            f"Please generate a specific video idea that takes about the following topic: {self.niche}. Make it exactly one sentence. Only return the topic, nothing else."
+            f"{self._get_character_context_block()}"
+            f"Please generate a specific video idea that takes about the following topic: {self.niche}. "
+            "Make it exactly one sentence. Only return the topic, nothing else."
         )
 
         if not completion:
@@ -175,6 +237,7 @@ class YouTube:
         YOU MUST NOT INCLUDE ANY TYPE OF MARKDOWN OR FORMATTING IN THE SCRIPT, NEVER USE A TITLE.
         YOU MUST WRITE THE SCRIPT IN THE LANGUAGE SPECIFIED IN [LANGUAGE].
         ONLY RETURN THE RAW CONTENT OF THE SCRIPT. DO NOT INCLUDE "VOICEOVER", "NARRATOR" OR SIMILAR INDICATORS OF WHAT SHOULD BE SPOKEN AT THE BEGINNING OF EACH PARAGRAPH OR LINE. YOU MUST NOT MENTION THE PROMPT, OR ANYTHING ABOUT THE SCRIPT ITSELF. ALSO, NEVER TALK ABOUT THE AMOUNT OF PARAGRAPHS OR LINES. JUST WRITE THE SCRIPT
+        {self._get_character_context_block()}
         
         Subject: {self.subject}
         Language: {self.language}
@@ -205,7 +268,9 @@ class YouTube:
             metadata (dict): The generated metadata.
         """
         title = self.generate_response(
-            f"Please generate a YouTube Video Title for the following subject, including hashtags: {self.subject}. Only return the title, nothing else. Limit the title under 100 characters."
+            f"{self._get_character_context_block()}"
+            f"Please generate a YouTube Video Title for the following subject, including hashtags: {self.subject}. "
+            "Only return the title, nothing else. Limit the title under 100 characters."
         )
 
         if len(title) > 100:
@@ -214,7 +279,9 @@ class YouTube:
             return self.generate_metadata()
 
         description = self.generate_response(
-            f"Please generate a YouTube Video Description for the following script: {self.script}. Only return the description, nothing else."
+            f"{self._get_character_context_block()}"
+            f"Please generate a YouTube Video Description for the following script: {self.script}. "
+            "Only return the description, nothing else."
         )
 
         self.metadata = {"title": title, "description": description}
@@ -228,18 +295,20 @@ class YouTube:
         Returns:
             image_prompts (List[str]): Generated List of image prompts.
         """
-        n_prompts = len(self.script) / 3
+        n_prompts = self._get_target_prompt_count()
 
         prompt = f"""
-        Generate {n_prompts} Image Prompts for AI Image Generation,
+        Generate exactly {n_prompts} image prompts for AI image generation,
         depending on the subject of a video.
         Subject: {self.subject}
+        {self._get_character_context_block()}
 
         The image prompts are to be returned as
         a JSON-Array of strings.
 
-        Each search term should consist of a full sentence,
-        always add the main subject of the video.
+        Each prompt should be one vivid still-image description sentence.
+        Do not number the prompts.
+        Always include the main subject of the video.
 
         Be emotional and use interesting adjectives to make the
         Image Prompt as detailed as possible.
@@ -285,14 +354,61 @@ class YouTube:
                         warning("Failed to generate Image Prompts. Retrying...")
                     return self.generate_prompts()
 
+        if len(image_prompts) == 1 and isinstance(image_prompts[0], str):
+            try:
+                image_prompts = json.loads(image_prompts[0])
+            except Exception:
+                pass
+
+        image_prompts = [
+            self._clean_image_prompt(prompt)
+            for prompt in image_prompts
+            if isinstance(prompt, str) and prompt.strip()
+        ]
+
+        if len(image_prompts) == 0:
+            if get_verbose():
+                warning("No usable image prompts returned. Retrying...")
+            return self.generate_prompts()
+
         if len(image_prompts) > n_prompts:
-            image_prompts = image_prompts[: int(n_prompts)]
+            image_prompts = image_prompts[:n_prompts]
 
         self.image_prompts = image_prompts
 
         success(f"Generated {len(image_prompts)} Image Prompts.")
 
         return image_prompts
+
+    def _get_target_prompt_count(self) -> int:
+        """
+        Derives a sensible prompt count from the script sentence count.
+
+        Returns:
+            prompt_count (int): Number of prompts to request
+        """
+        sentences = [
+            sentence.strip()
+            for sentence in re.split(r"[.!?؟\n]+", self.script)
+            if sentence.strip()
+        ]
+        sentence_count = len(sentences) or MIN_IMAGE_PROMPTS
+        return max(MIN_IMAGE_PROMPTS, min(MAX_IMAGE_PROMPTS, sentence_count))
+
+    def _clean_image_prompt(self, prompt: str) -> str:
+        """
+        Removes numbering noise from LLM-generated prompts.
+
+        Args:
+            prompt (str): Raw prompt string
+
+        Returns:
+            cleaned (str): Cleaned prompt
+        """
+        cleaned = prompt.strip()
+        cleaned = re.sub(r"^image prompt\s*\d+\s*:\s*", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"^\d+[\).\:-]\s*", "", cleaned)
+        return cleaned.strip()
 
     def _persist_image(self, image_bytes: bytes, provider_label: str) -> str:
         """
@@ -346,36 +462,54 @@ class YouTube:
             },
         }
 
-        try:
-            response = requests.post(
-                endpoint,
-                headers={"x-goog-api-key": api_key, "Content-Type": "application/json"},
-                json=payload,
-                timeout=300,
-            )
-            response.raise_for_status()
-            body = response.json()
+        for attempt in range(1, IMAGE_RATE_LIMIT_RETRIES + 2):
+            try:
+                response = requests.post(
+                    endpoint,
+                    headers={"x-goog-api-key": api_key, "Content-Type": "application/json"},
+                    json=payload,
+                    timeout=300,
+                )
 
-            candidates = body.get("candidates", [])
-            for candidate in candidates:
-                content = candidate.get("content", {})
-                for part in content.get("parts", []):
-                    inline_data = part.get("inlineData") or part.get("inline_data")
-                    if not inline_data:
-                        continue
-                    data = inline_data.get("data")
-                    mime_type = inline_data.get("mimeType") or inline_data.get("mime_type", "")
-                    if data and str(mime_type).startswith("image/"):
-                        image_bytes = base64.b64decode(data)
-                        return self._persist_image(image_bytes, "Nano Banana 2 API")
+                if response.status_code == 429:
+                    if attempt > IMAGE_RATE_LIMIT_RETRIES:
+                        response.raise_for_status()
 
-            if get_verbose():
-                warning(f"Nano Banana 2 did not return an image payload. Response: {body}")
-            return None
-        except Exception as e:
-            if get_verbose():
-                warning(f"Failed to generate image with Nano Banana 2 API: {str(e)}")
-            return None
+                    retry_after = response.headers.get("Retry-After")
+                    wait_seconds = (
+                        int(retry_after)
+                        if retry_after and retry_after.isdigit()
+                        else IMAGE_RATE_LIMIT_BACKOFF_SECONDS * attempt
+                    )
+                    warning(
+                        f"Image API rate-limited. Waiting {wait_seconds}s before retry {attempt}/{IMAGE_RATE_LIMIT_RETRIES}."
+                    )
+                    time.sleep(wait_seconds)
+                    continue
+
+                response.raise_for_status()
+                body = response.json()
+
+                candidates = body.get("candidates", [])
+                for candidate in candidates:
+                    content = candidate.get("content", {})
+                    for part in content.get("parts", []):
+                        inline_data = part.get("inlineData") or part.get("inline_data")
+                        if not inline_data:
+                            continue
+                        data = inline_data.get("data")
+                        mime_type = inline_data.get("mimeType") or inline_data.get("mime_type", "")
+                        if data and str(mime_type).startswith("image/"):
+                            image_bytes = base64.b64decode(data)
+                            return self._persist_image(image_bytes, "Nano Banana 2 API")
+
+                if get_verbose():
+                    warning(f"Nano Banana 2 did not return an image payload. Response: {body}")
+                return None
+            except Exception as e:
+                if get_verbose():
+                    warning(f"Failed to generate image with Nano Banana 2 API: {str(e)}")
+                return None
 
     def generate_image(self, prompt: str) -> str:
         """
@@ -556,6 +690,11 @@ class YouTube:
         Returns:
             path (str): The path to the generated MP4 File.
         """
+        if len(self.images) == 0:
+            raise RuntimeError(
+                "No images were generated, so the video cannot be combined."
+            )
+
         combined_image_path = os.path.join(ROOT_DIR, ".mp", str(uuid4()) + ".mp4")
         threads = get_threads()
         tts_clip = AudioFileClip(self.tts_path)
@@ -669,8 +808,20 @@ class YouTube:
         self.generate_prompts()
 
         # Generate the Images
+        generated_images = 0
         for prompt in self.image_prompts:
-            self.generate_image(prompt)
+            if self.generate_image(prompt):
+                generated_images += 1
+
+        if generated_images == 0:
+            raise RuntimeError(
+                "Image generation failed for all prompts. Check your Gemini image API quota and try again."
+            )
+
+        if generated_images < len(self.image_prompts):
+            warning(
+                f"Generated {generated_images}/{len(self.image_prompts)} images. Continuing with the successful ones."
+            )
 
         # Generate the TTS
         self.generate_script_to_speech(tts_instance)
@@ -692,6 +843,11 @@ class YouTube:
         Returns:
             channel_id (str): The Channel ID.
         """
+        if self.browser is None:
+            raise RuntimeError(
+                "YouTube browser session is not initialized. Recreate this account session with browser access enabled."
+            )
+
         driver = self.browser
         driver.get("https://studio.youtube.com")
         time.sleep(2)
@@ -707,6 +863,11 @@ class YouTube:
         Returns:
             success (bool): Whether the upload was successful or not.
         """
+        if self.browser is None:
+            raise RuntimeError(
+                "YouTube browser session is not initialized. Recreate this account session with browser access enabled."
+            )
+
         try:
             self.get_channel_id()
 

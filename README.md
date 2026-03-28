@@ -66,6 +66,14 @@ pip install -r requirements.txt
 python src/main.py
 ```
 
+## GUI
+
+You can also run the first Streamlit-based GUI:
+
+```bash
+streamlit run app_gui.py
+```
+
 ## Documentation
 
 All relevant document can be found [here](docs/).

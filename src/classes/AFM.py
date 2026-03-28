@@ -1,4 +1,5 @@
 import os
+import subprocess
 from urllib.parse import urlparse
 from typing import Any
 
@@ -55,6 +56,8 @@ class AffiliateMarketing:
                 f"Firefox profile path does not exist or is not a directory: {fp_profile_path}"
             )
 
+        self._assert_profile_is_available(fp_profile_path)
+
         # Set the profile path
         self.options.add_argument("-profile")
         self.options.add_argument(fp_profile_path)
@@ -87,6 +90,37 @@ class AffiliateMarketing:
 
         # Scrape the product information
         self.scrape_product_information()
+
+    def _assert_profile_is_available(self, profile_path: str) -> None:
+        """
+        Ensures the Firefox profile is not currently locked by another running
+        Firefox process before Selenium tries to launch it.
+
+        Args:
+            profile_path (str): Firefox profile folder
+
+        Returns:
+            None
+        """
+        lock_path = os.path.join(profile_path, "parent.lock")
+        if not os.path.exists(lock_path):
+            return
+
+        try:
+            result = subprocess.run(
+                ["tasklist", "/FI", "IMAGENAME eq firefox.exe"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            firefox_running = "firefox.exe" in result.stdout.lower()
+        except Exception:
+            firefox_running = True
+
+        if firefox_running:
+            raise RuntimeError(
+                "The selected Firefox profile is currently in use. Close Firefox completely and try again."
+            )
 
     def scrape_product_information(self) -> None:
         """
