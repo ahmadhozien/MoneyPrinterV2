@@ -164,5 +164,20 @@
   "tts_voice": "Jasper",
   "font": "bold_font.ttf",
   "imagemagick_path": "Path to magick.exe or on linux/macOS just /usr/bin/convert",
-  "script_sentence_length": 4
+  "script_sentence_length": 4,
+  "sound_effects_enabled": true,
+  "sound_effects_volume": 0.45,
+  "sound_effects_offset": -0.15,
+  "sound_effects": {
+    "كارثة": "boom.wav",
+    "فجأة": "whoosh.wav",
+    "اختفى": "glitch.wav",
+    "صدمة": "hit.wav",
+    "خطير": "rise.wav",
+    "انهيار": "drop.wav",
+    "لكن": "transition.wav",
+    "مفاجأة": "notification.wav",
+    "رعب": "suspense.wav",
+    "الحقيقة": "reveal.wav"
+  }
 }

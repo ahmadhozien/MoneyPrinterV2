@@ -666,160 +666,6 @@ class YouTube:
 
         return report
 
-    def _to_workspace_relative_path(self, value: str) -> str:
-        """
-        Converts an absolute workspace file path into a workspace-relative path
-        for persistence.
-
-        Args:
-            value (str): absolute or relative path
-
-        Returns:
-            path (str): workspace-relative path when possible
-        """
-        normalized = os.path.abspath(str(value or "").strip())
-        workspace_dir = os.path.abspath(self._get_workspace_dir())
-        try:
-            common = os.path.commonpath([workspace_dir, normalized])
-        except ValueError:
-            return normalized
-        if common == workspace_dir:
-            return os.path.relpath(normalized, workspace_dir)
-        return normalized
-
-    def _from_workspace_relative_path(self, value: str, workspace_dir: str) -> str:
-        """
-        Resolves a persisted workspace-relative path back into an absolute
-        filesystem path.
-
-        Args:
-            value (str): persisted path
-            workspace_dir (str): workspace directory
-
-        Returns:
-            path (str): absolute file path
-        """
-        raw = str(value or "").strip()
-        if not raw:
-            return ""
-        if os.path.isabs(raw):
-            return os.path.abspath(raw)
-        return os.path.abspath(os.path.join(workspace_dir, raw))
-
-    def _build_workspace_state(self) -> dict:
-        """
-        Builds a persisted snapshot of the current generation state so an
-        interrupted final render can be resumed later without regenerating
-        prompts, assets, or audio.
-
-        Returns:
-            payload (dict): persisted workspace state
-        """
-        workspace_dir = os.path.abspath(self._get_workspace_dir())
-        return {
-            "account_uuid": self._account_uuid,
-            "account_nickname": self._account_nickname,
-            "workspace_dir": workspace_dir,
-            "subject": getattr(self, "subject", ""),
-            "script": getattr(self, "script", ""),
-            "metadata": getattr(self, "metadata", {}),
-            "image_prompts": list(getattr(self, "image_prompts", []) or []),
-            "scene_units": list(getattr(self, "scene_units", []) or []),
-            "images": [
-                self._to_workspace_relative_path(path)
-                for path in list(getattr(self, "images", []) or [])
-                if str(path or "").strip()
-            ],
-            "visual_assets": [
-                {
-                    **asset,
-                    "path": self._to_workspace_relative_path(asset.get("path", "")),
-                }
-                for asset in list(getattr(self, "visual_assets", []) or [])
-                if isinstance(asset, dict) and str(asset.get("path", "")).strip()
-            ],
-            "tts_path": self._to_workspace_relative_path(getattr(self, "tts_path", "")),
-            "video_path": self._to_workspace_relative_path(getattr(self, "video_path", "")),
-            "language": self.language,
-            "dialect": self.dialect,
-            "niche": self.niche,
-            "character_context": self._character_context,
-            "is_for_kids": self._is_for_kids,
-            "cost_items": list(getattr(self, "_cost_items", []) or []),
-            "cost_notes": list(getattr(self, "_cost_notes", []) or []),
-            "updated_at": datetime.now().isoformat(timespec="seconds"),
-        }
-
-    def _write_workspace_state(self) -> dict:
-        """
-        Persists the current workspace state to disk.
-
-        Returns:
-            payload (dict): saved workspace state
-        """
-        payload = self._build_workspace_state()
-        state_path = self._get_workspace_path("run_state.json")
-        with open(state_path, "w", encoding="utf-8") as file:
-            json.dump(payload, file, indent=2, ensure_ascii=False)
-        return payload
-
-    def load_workspace_state(self, workspace_dir: str) -> dict:
-        """
-        Loads a previously saved workspace state so generation can resume from
-        saved assets and voiceover output.
-
-        Args:
-            workspace_dir (str): target workspace directory
-
-        Returns:
-            payload (dict): loaded workspace payload
-        """
-        normalized_workspace_dir = os.path.abspath(str(workspace_dir or "").strip())
-        if not normalized_workspace_dir:
-            raise RuntimeError("Workspace directory is required for recovery.")
-
-        state_path = os.path.join(normalized_workspace_dir, "run_state.json")
-        if not os.path.exists(state_path):
-            raise RuntimeError(
-                f'No recovery state was found in "{normalized_workspace_dir}".'
-            )
-
-        with open(state_path, "r", encoding="utf-8") as file:
-            payload = json.load(file) or {}
-
-        self._workspace_dir = normalized_workspace_dir
-        self.subject = str(payload.get("subject", "") or "")
-        self.script = str(payload.get("script", "") or "")
-        self.metadata = dict(payload.get("metadata", {}) or {})
-        self.image_prompts = list(payload.get("image_prompts", []) or [])
-        self.scene_units = list(payload.get("scene_units", []) or [])
-        self.images = [
-            self._from_workspace_relative_path(path, normalized_workspace_dir)
-            for path in list(payload.get("images", []) or [])
-            if str(path or "").strip()
-        ]
-        self.visual_assets = []
-        for asset in list(payload.get("visual_assets", []) or []):
-            if not isinstance(asset, dict):
-                continue
-            restored_asset = dict(asset)
-            restored_asset["path"] = self._from_workspace_relative_path(
-                restored_asset.get("path", ""),
-                normalized_workspace_dir,
-            )
-            self.visual_assets.append(restored_asset)
-        self.tts_path = self._from_workspace_relative_path(
-            payload.get("tts_path", ""),
-            normalized_workspace_dir,
-        )
-        self.video_path = self._from_workspace_relative_path(
-            payload.get("video_path", ""),
-            normalized_workspace_dir,
-        )
-        self._cost_items = list(payload.get("cost_items", []) or [])
-        self._cost_notes = list(payload.get("cost_notes", []) or [])
-        return payload
-
     def _slugify_label(self, value: str) -> str:
         """
         Converts a label into a filesystem-friendly slug.
@@ -1014,7 +860,6 @@ class YouTube:
             "Generated video topic.",
             {"subject": completion},
         )
-        self._write_workspace_state()
 
         return completion
 
@@ -1071,7 +916,6 @@ class YouTube:
             "Generated narration script.",
             {"script": completion},
         )
-        self._write_workspace_state()
 
         return completion
 
@@ -1119,7 +963,6 @@ class YouTube:
             "Using provided narration script.",
             {"script": self.script},
         )
-        self._write_workspace_state()
 
     def generate_metadata(self) -> dict:
         """
@@ -1226,7 +1069,6 @@ class YouTube:
             "Generated YouTube metadata.",
             {"metadata": self.metadata},
         )
-        self._write_workspace_state()
 
         return self.metadata
 
@@ -1344,7 +1186,6 @@ class YouTube:
             f"Generated {len(image_prompts)} image prompts.",
             {"image_prompts": image_prompts},
         )
-        self._write_workspace_state()
 
         return image_prompts
 
@@ -1646,7 +1487,6 @@ class YouTube:
                 "scene_index": scene_index,
             },
         )
-        self._write_workspace_state()
         return image_path
 
     def _persist_binary_asset(self, asset_bytes: bytes, filename: str, source_label: str, asset_type: str, scene_index: int | None = None) -> str:
@@ -1684,7 +1524,6 @@ class YouTube:
                 "scene_index": scene_index,
             },
         )
-        self._write_workspace_state()
         return asset_path
 
     def _get_pixabay_cache_path(self) -> str:
@@ -3440,10 +3279,22 @@ class YouTube:
         Returns:
             durations (list[float]): per-scene durations aligned to speech, or empty list on failure
         """
-        segments, _, _, _ = self._transcribe_with_whisper(
-            self.tts_path,
-            word_timestamps=True,
-        )
+        from faster_whisper import WhisperModel
+
+        device = get_whisper_device()
+        compute_type = get_whisper_compute_type()
+        try:
+            model = WhisperModel(get_whisper_model(), device=device, compute_type=compute_type)
+        except Exception:
+            # CUDA/cuBLAS not available — fall back to CPU
+            model = WhisperModel(get_whisper_model(), device="cpu", compute_type="int8")
+
+        transcription_language = self._get_transcription_language_code()
+        transcribe_kwargs = {"vad_filter": True, "task": "transcribe", "word_timestamps": True}
+        if transcription_language:
+            transcribe_kwargs["language"] = transcription_language
+
+        segments, _ = model.transcribe(self.tts_path, **transcribe_kwargs)
 
         # Collect all words with their timestamps
         words_with_times = []
@@ -4056,7 +3907,6 @@ class YouTube:
             "Generated voiceover audio.",
             {"tts_path": path},
         )
-        self._write_workspace_state()
 
         return path
 
@@ -4171,78 +4021,6 @@ class YouTube:
             "english": "en",
         }
         return language_map.get(normalized)
-
-    def _get_whisper_transcribe_kwargs(self, *, word_timestamps: bool = False) -> dict:
-        """
-        Builds the standard faster-whisper transcription kwargs for the current
-        language configuration.
-
-        Args:
-            word_timestamps (bool): whether to request word timestamps
-
-        Returns:
-            kwargs (dict): transcription kwargs
-        """
-        transcription_language = self._get_transcription_language_code()
-        transcribe_kwargs = {
-            "vad_filter": True,
-            "task": "transcribe",
-            "word_timestamps": bool(word_timestamps),
-        }
-        if transcription_language:
-            transcribe_kwargs["language"] = transcription_language
-        return transcribe_kwargs
-
-    def _transcribe_with_whisper(self, audio_path: str, *, word_timestamps: bool = False):
-        """
-        Runs faster-whisper with a CPU fallback when the configured backend is
-        unavailable or broken.
-
-        Args:
-            audio_path (str): audio file path
-            word_timestamps (bool): whether to request word timestamps
-
-        Returns:
-            result (tuple[list, object, str, str]): segments, info, device, compute type
-        """
-        from faster_whisper import WhisperModel
-
-        requested_device = get_whisper_device()
-        requested_compute_type = get_whisper_compute_type()
-        transcribe_kwargs = self._get_whisper_transcribe_kwargs(
-            word_timestamps=word_timestamps
-        )
-
-        def attempt(device: str, compute_type: str):
-            model = WhisperModel(
-                get_whisper_model(),
-                device=device,
-                compute_type=compute_type,
-            )
-            segments_iter, info = model.transcribe(audio_path, **transcribe_kwargs)
-            return list(segments_iter), info
-
-        try:
-            segments, info = attempt(requested_device, requested_compute_type)
-            return segments, info, requested_device, requested_compute_type
-        except Exception as primary_exc:
-            if requested_device == "cpu" and requested_compute_type == "int8":
-                raise
-
-            warning(
-                f'Whisper backend "{requested_device}/{requested_compute_type}" failed. '
-                f'Falling back to CPU int8: {primary_exc}'
-            )
-            self._emit_progress(
-                "subtitles",
-                "Configured Whisper backend failed, retrying on CPU.",
-                {
-                    "requested_device": requested_device,
-                    "requested_compute_type": requested_compute_type,
-                },
-            )
-            segments, info = attempt("cpu", "int8")
-            return segments, info, "cpu", "int8"
 
     def _contains_arabic_text(self, value: str) -> bool:
         """
@@ -4794,19 +4572,19 @@ class YouTube:
             )
             raise
 
-        self._emit_progress(
-            "subtitles_start",
-            "Generating subtitles with local Whisper...",
-            {
-                "provider": "local_whisper",
-                "requested_device": get_whisper_device(),
-                "requested_compute_type": get_whisper_compute_type(),
-            },
-        )
-        segments, _, used_device, used_compute_type = self._transcribe_with_whisper(
-            audio_path,
-            word_timestamps=False,
-        )
+        device = get_whisper_device()
+        compute_type = get_whisper_compute_type()
+        try:
+            model = WhisperModel(get_whisper_model(), device=device, compute_type=compute_type)
+        except Exception:
+            model = WhisperModel(get_whisper_model(), device="cpu", compute_type="int8")
+
+        transcription_language = self._get_transcription_language_code()
+        transcribe_kwargs = {"vad_filter": True, "task": "transcribe"}
+        if transcription_language:
+            transcribe_kwargs["language"] = transcription_language
+
+        segments, _ = model.transcribe(audio_path, **transcribe_kwargs)
 
         lines = []
         for idx, segment in enumerate(segments, start=1):
@@ -4827,11 +4605,6 @@ class YouTube:
         with open(srt_path, "w", encoding="utf-8") as file:
             file.write(subtitles)
 
-        self._emit_progress(
-            "subtitles",
-            f"Generated subtitles with Whisper on {used_device}/{used_compute_type}.",
-            {"subtitle_entries": len(lines) // 4, "subtitles_path": srt_path},
-        )
         self._record_stt_cost("local_whisper", audio_path, get_whisper_model(), "Local Whisper subtitles")
         return srt_path
 
@@ -4890,28 +4663,19 @@ class YouTube:
         except Exception as e:
             warning(f"Failed to generate subtitles, continuing without subtitles: {e}")
 
-        audio_layers = [tts_clip.set_fps(44100)]
-
+        final_audio = tts_clip.set_fps(44100)
         try:
             random_song = choose_random_song()
             random_song_clip = AudioFileClip(random_song).set_fps(44100)
+
+            # Audio ducking: lower music when voice is active, raise during pauses
             random_song_clip = self._apply_audio_ducking(
                 tts_clip, random_song_clip, voice_vol=0.15, silence_vol=0.4
             )
-            audio_layers.append(random_song_clip)
+            final_audio = CompositeAudioClip([final_audio, random_song_clip])
         except Exception as e:
             warning(f"Failed to add background song, continuing with voiceover only: {e}")
 
-        if get_sound_effects_enabled():
-            try:
-                sfx_clips = self._build_sound_effects_clips(self.tts_path)
-                if sfx_clips:
-                    audio_layers.extend(sfx_clips)
-                    info(f" => Added {len(sfx_clips)} sound effects to the audio mix.")
-            except Exception as e:
-                warning(f"Failed to add sound effects: {e}")
-
-        final_audio = CompositeAudioClip(audio_layers)
         final_clip = final_clip.set_audio(final_audio)
         final_clip = final_clip.set_duration(tts_clip.duration)
 
@@ -4933,56 +4697,13 @@ class YouTube:
         )
 
         success(f'Wrote Video to "{combined_image_path}"')
-        self.video_path = os.path.abspath(combined_image_path)
         self._emit_progress(
             "done",
             "Finished writing the final video.",
             {"video_path": combined_image_path},
         )
-        self._write_workspace_state()
 
         return combined_image_path
-
-    def rerender_video_from_workspace(self, workspace_dir: str | None = None) -> str:
-        """
-        Rebuilds the final video from a previously saved workspace without
-        regenerating text, prompts, assets, or TTS.
-
-        Args:
-            workspace_dir (str | None): optional workspace path override
-
-        Returns:
-            path (str): regenerated MP4 path
-        """
-        if workspace_dir:
-            self.load_workspace_state(workspace_dir)
-
-        if not str(getattr(self, "tts_path", "") or "").strip() or not os.path.exists(self.tts_path):
-            raise RuntimeError(
-                "This workspace does not contain a saved voiceover, so the final video cannot be rebuilt."
-            )
-
-        if not self.visual_assets:
-            raise RuntimeError(
-                "This workspace does not contain saved visual assets, so the final video cannot be rebuilt."
-            )
-
-        self._emit_progress(
-            "recovery",
-            "Loaded saved workspace state. Rebuilding the final video from existing assets.",
-            {
-                "workspace_dir": self._get_workspace_dir(),
-                "asset_count": len(self.visual_assets),
-            },
-        )
-        self._write_workspace_state()
-        path = self.combine()
-
-        pricing_report = self._write_pricing_report()
-        if isinstance(getattr(self, "metadata", None), dict):
-            self.metadata["pricing"] = pricing_report
-        self._write_workspace_state()
-        return path
 
     def _ffmpeg_supports_encoder(self, encoder_name: str) -> bool:
         """

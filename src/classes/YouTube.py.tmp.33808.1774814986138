@@ -148,7 +148,6 @@ class YouTube:
         self._cost_items = []
         self._cost_notes = []
         self._pixabay_selection_debug = []
-        self._progress_callback = None
 
         # Initialize the Firefox profile
         self.options: Options = Options()
@@ -236,45 +235,6 @@ class YouTube:
             dialect (str): The dialect/style
         """
         return self._dialect
-
-    def set_progress_callback(self, callback) -> None:
-        """
-        Sets an optional callback used by interactive UIs to receive live
-        generation progress updates.
-
-        Args:
-            callback: callable that accepts one dict payload
-
-        Returns:
-            None
-        """
-        self._progress_callback = callback if callable(callback) else None
-
-    def _emit_progress(self, stage: str, message: str, payload: dict | None = None) -> None:
-        """
-        Sends one structured progress update to the registered callback.
-
-        Args:
-            stage (str): logical generation stage
-            message (str): human-readable status line
-            payload (dict | None): optional structured details
-
-        Returns:
-            None
-        """
-        if not callable(self._progress_callback):
-            return
-
-        try:
-            self._progress_callback(
-                {
-                    "stage": str(stage or "").strip(),
-                    "message": str(message or "").strip(),
-                    "payload": payload or {},
-                }
-            )
-        except Exception:
-            pass
 
     def generate_response(self, prompt: str, model_name: str = None) -> str:
         """
@@ -666,160 +626,6 @@ class YouTube:
 
         return report
 
-    def _to_workspace_relative_path(self, value: str) -> str:
-        """
-        Converts an absolute workspace file path into a workspace-relative path
-        for persistence.
-
-        Args:
-            value (str): absolute or relative path
-
-        Returns:
-            path (str): workspace-relative path when possible
-        """
-        normalized = os.path.abspath(str(value or "").strip())
-        workspace_dir = os.path.abspath(self._get_workspace_dir())
-        try:
-            common = os.path.commonpath([workspace_dir, normalized])
-        except ValueError:
-            return normalized
-        if common == workspace_dir:
-            return os.path.relpath(normalized, workspace_dir)
-        return normalized
-
-    def _from_workspace_relative_path(self, value: str, workspace_dir: str) -> str:
-        """
-        Resolves a persisted workspace-relative path back into an absolute
-        filesystem path.
-
-        Args:
-            value (str): persisted path
-            workspace_dir (str): workspace directory
-
-        Returns:
-            path (str): absolute file path
-        """
-        raw = str(value or "").strip()
-        if not raw:
-            return ""
-        if os.path.isabs(raw):
-            return os.path.abspath(raw)
-        return os.path.abspath(os.path.join(workspace_dir, raw))
-
-    def _build_workspace_state(self) -> dict:
-        """
-        Builds a persisted snapshot of the current generation state so an
-        interrupted final render can be resumed later without regenerating
-        prompts, assets, or audio.
-
-        Returns:
-            payload (dict): persisted workspace state
-        """
-        workspace_dir = os.path.abspath(self._get_workspace_dir())
-        return {
-            "account_uuid": self._account_uuid,
-            "account_nickname": self._account_nickname,
-            "workspace_dir": workspace_dir,
-            "subject": getattr(self, "subject", ""),
-            "script": getattr(self, "script", ""),
-            "metadata": getattr(self, "metadata", {}),
-            "image_prompts": list(getattr(self, "image_prompts", []) or []),
-            "scene_units": list(getattr(self, "scene_units", []) or []),
-            "images": [
-                self._to_workspace_relative_path(path)
-                for path in list(getattr(self, "images", []) or [])
-                if str(path or "").strip()
-            ],
-            "visual_assets": [
-                {
-                    **asset,
-                    "path": self._to_workspace_relative_path(asset.get("path", "")),
-                }
-                for asset in list(getattr(self, "visual_assets", []) or [])
-                if isinstance(asset, dict) and str(asset.get("path", "")).strip()
-            ],
-            "tts_path": self._to_workspace_relative_path(getattr(self, "tts_path", "")),
-            "video_path": self._to_workspace_relative_path(getattr(self, "video_path", "")),
-            "language": self.language,
-            "dialect": self.dialect,
-            "niche": self.niche,
-            "character_context": self._character_context,
-            "is_for_kids": self._is_for_kids,
-            "cost_items": list(getattr(self, "_cost_items", []) or []),
-            "cost_notes": list(getattr(self, "_cost_notes", []) or []),
-            "updated_at": datetime.now().isoformat(timespec="seconds"),
-        }
-
-    def _write_workspace_state(self) -> dict:
-        """
-        Persists the current workspace state to disk.
-
-        Returns:
-            payload (dict): saved workspace state
-        """
-        payload = self._build_workspace_state()
-        state_path = self._get_workspace_path("run_state.json")
-        with open(state_path, "w", encoding="utf-8") as file:
-            json.dump(payload, file, indent=2, ensure_ascii=False)
-        return payload
-
-    def load_workspace_state(self, workspace_dir: str) -> dict:
-        """
-        Loads a previously saved workspace state so generation can resume from
-        saved assets and voiceover output.
-
-        Args:
-            workspace_dir (str): target workspace directory
-
-        Returns:
-            payload (dict): loaded workspace payload
-        """
-        normalized_workspace_dir = os.path.abspath(str(workspace_dir or "").strip())
-        if not normalized_workspace_dir:
-            raise RuntimeError("Workspace directory is required for recovery.")
-
-        state_path = os.path.join(normalized_workspace_dir, "run_state.json")
-        if not os.path.exists(state_path):
-            raise RuntimeError(
-                f'No recovery state was found in "{normalized_workspace_dir}".'
-            )
-
-        with open(state_path, "r", encoding="utf-8") as file:
-            payload = json.load(file) or {}
-
-        self._workspace_dir = normalized_workspace_dir
-        self.subject = str(payload.get("subject", "") or "")
-        self.script = str(payload.get("script", "") or "")
-        self.metadata = dict(payload.get("metadata", {}) or {})
-        self.image_prompts = list(payload.get("image_prompts", []) or [])
-        self.scene_units = list(payload.get("scene_units", []) or [])
-        self.images = [
-            self._from_workspace_relative_path(path, normalized_workspace_dir)
-            for path in list(payload.get("images", []) or [])
-            if str(path or "").strip()
-        ]
-        self.visual_assets = []
-        for asset in list(payload.get("visual_assets", []) or []):
-            if not isinstance(asset, dict):
-                continue
-            restored_asset = dict(asset)
-            restored_asset["path"] = self._from_workspace_relative_path(
-                restored_asset.get("path", ""),
-                normalized_workspace_dir,
-            )
-            self.visual_assets.append(restored_asset)
-        self.tts_path = self._from_workspace_relative_path(
-            payload.get("tts_path", ""),
-            normalized_workspace_dir,
-        )
-        self.video_path = self._from_workspace_relative_path(
-            payload.get("video_path", ""),
-            normalized_workspace_dir,
-        )
-        self._cost_items = list(payload.get("cost_items", []) or [])
-        self._cost_notes = list(payload.get("cost_notes", []) or [])
-        return payload
-
     def _slugify_label(self, value: str) -> str:
         """
         Converts a label into a filesystem-friendly slug.
@@ -1009,12 +815,6 @@ class YouTube:
             error("Failed to generate Topic.")
 
         self.subject = completion
-        self._emit_progress(
-            "topic",
-            "Generated video topic.",
-            {"subject": completion},
-        )
-        self._write_workspace_state()
 
         return completion
 
@@ -1066,12 +866,6 @@ class YouTube:
 
         self.script = completion
         self.scene_units = []
-        self._emit_progress(
-            "script",
-            "Generated narration script.",
-            {"script": completion},
-        )
-        self._write_workspace_state()
 
         return completion
 
@@ -1109,17 +903,6 @@ class YouTube:
         self.subject = cleaned_subject or self._derive_subject_from_script(cleaned_script)
         self.script = cleaned_script
         self.scene_units = []
-        self._emit_progress(
-            "topic",
-            "Using provided video subject.",
-            {"subject": self.subject},
-        )
-        self._emit_progress(
-            "script",
-            "Using provided narration script.",
-            {"script": self.script},
-        )
-        self._write_workspace_state()
 
     def generate_metadata(self) -> dict:
         """
@@ -1221,12 +1004,6 @@ class YouTube:
             "hashtags": hashtags,
             "tags": tags,
         }
-        self._emit_progress(
-            "metadata",
-            "Generated YouTube metadata.",
-            {"metadata": self.metadata},
-        )
-        self._write_workspace_state()
 
         return self.metadata
 
@@ -1339,12 +1116,6 @@ class YouTube:
         self.scene_units = scene_units
 
         success(f"Generated {len(image_prompts)} Image Prompts.")
-        self._emit_progress(
-            "image_prompts",
-            f"Generated {len(image_prompts)} image prompts.",
-            {"image_prompts": image_prompts},
-        )
-        self._write_workspace_state()
 
         return image_prompts
 
@@ -1636,17 +1407,6 @@ class YouTube:
 
         self.images.append(image_path)
         self.visual_assets.append({"type": "image", "path": image_path, "source": provider_label, "scene_index": scene_index})
-        self._emit_progress(
-            "visual_asset",
-            f"Saved {provider_label} image asset for scene {int(scene_index or 0) + 1}.",
-            {
-                "asset_type": "image",
-                "source": provider_label,
-                "path": image_path,
-                "scene_index": scene_index,
-            },
-        )
-        self._write_workspace_state()
         return image_path
 
     def _persist_binary_asset(self, asset_bytes: bytes, filename: str, source_label: str, asset_type: str, scene_index: int | None = None) -> str:
@@ -1674,17 +1434,6 @@ class YouTube:
         self.visual_assets.append({"type": asset_type, "path": asset_path, "source": source_label, "scene_index": scene_index})
         if get_verbose():
             info(f' => Wrote {asset_type} from {source_label} to "{asset_path}"')
-        self._emit_progress(
-            "visual_asset",
-            f"Saved {source_label} {asset_type} asset for scene {int(scene_index or 0) + 1}.",
-            {
-                "asset_type": asset_type,
-                "source": source_label,
-                "path": asset_path,
-                "scene_index": scene_index,
-            },
-        )
-        self._write_workspace_state()
         return asset_path
 
     def _get_pixabay_cache_path(self) -> str:
@@ -3404,8 +3153,12 @@ class YouTube:
 
     def _get_scene_durations(self, total_duration: float) -> list[float]:
         """
-        Computes scene durations by aligning scene units to actual speech timing.
-        Uses Whisper word timestamps when available, falls back to text-weight estimation.
+        Estimates aligned scene durations from the ordered scene units.
+        Uses a weighted approach that accounts for:
+        - Word count (speech time)
+        - Sentence-ending punctuation (natural pauses after .!?؟)
+        - Mid-sentence punctuation (brief pauses for commas, semicolons)
+        - A minimum base time per scene (ensures short dramatic lines get screen time)
 
         Args:
             total_duration (float): total voiceover duration
@@ -3417,98 +3170,12 @@ class YouTube:
         if not scene_units:
             return [max(total_duration, 0.1)]
 
-        # Try Whisper-based alignment for accurate sync
-        if hasattr(self, 'tts_path') and self.tts_path and get_stt_provider() == "local_whisper":
-            try:
-                durations = self._get_scene_durations_from_whisper(total_duration, scene_units)
-                if durations:
-                    return durations
-            except Exception as e:
-                warning(f"Whisper scene alignment failed, using text-weight fallback: {e}")
-
-        return self._get_scene_durations_by_weight(total_duration, scene_units)
-
-    def _get_scene_durations_from_whisper(self, total_duration: float, scene_units: list[str]) -> list[float]:
-        """
-        Uses Whisper word-level timestamps to find where each scene unit
-        starts and ends in the actual audio, producing accurate durations.
-
-        Args:
-            total_duration (float): total voiceover duration
-            scene_units (list[str]): ordered scene text units
-
-        Returns:
-            durations (list[float]): per-scene durations aligned to speech, or empty list on failure
-        """
-        segments, _, _, _ = self._transcribe_with_whisper(
-            self.tts_path,
-            word_timestamps=True,
-        )
-
-        # Collect all words with their timestamps
-        words_with_times = []
-        for segment in segments:
-            if segment.words:
-                for word in segment.words:
-                    words_with_times.append({
-                        "word": str(word.word).strip().lower(),
-                        "start": word.start,
-                        "end": word.end,
-                    })
-
-        if not words_with_times:
-            return []
-
-        # Build a normalized word list for each scene unit
-        def normalize_words(text: str) -> list[str]:
-            return [w.lower().strip(".,!?;:،؛؟…\"'") for w in re.findall(r"\S+", str(text or ""), flags=re.UNICODE) if w.strip()]
-
-        scene_word_lists = [normalize_words(unit) for unit in scene_units]
-
-        # Match scene units to audio timestamps by walking through the word list
-        word_idx = 0
-        scene_boundaries = []
-        for scene_words in scene_word_lists:
-            if not scene_words or word_idx >= len(words_with_times):
-                scene_boundaries.append(None)
-                continue
-
-            start_idx = word_idx
-            # Try to find the best matching span of words for this scene
-            best_end_idx = min(word_idx + len(scene_words), len(words_with_times)) - 1
-
-            scene_start = words_with_times[start_idx]["start"]
-            scene_end = words_with_times[best_end_idx]["end"]
-            scene_boundaries.append((scene_start, scene_end))
-            word_idx = best_end_idx + 1
-
-        # Convert boundaries to durations
-        durations = []
-        for i, boundary in enumerate(scene_boundaries):
-            if boundary is None:
-                durations.append(0.8)
-            else:
-                durations.append(max(0.8, boundary[1] - boundary[0]))
-
-        # Normalize to match total_duration exactly
-        total_raw = sum(durations) or total_duration or 1.0
-        durations = [d * (total_duration / total_raw) for d in durations]
-        durations[-1] += max(0.0, total_duration - sum(durations))
-        return durations
-
-    def _get_scene_durations_by_weight(self, total_duration: float, scene_units: list[str]) -> list[float]:
-        """
-        Fallback: estimates scene durations from text characteristics.
-
-        Args:
-            total_duration (float): total voiceover duration
-            scene_units (list[str]): ordered scene text units
-
-        Returns:
-            durations (list[float]): per-scene durations
-        """
+        # Minimum base weight ensures even a single dramatic word gets ~1.5x
+        # the weight of a bare minimum scene
         BASE_WEIGHT = 1.5
+        # Sentence-ending punctuation adds a heavier pause weight
         SENTENCE_END_WEIGHT = 1.2
+        # Mid-sentence punctuation (commas, semicolons, colons) adds a lighter pause
         MID_PAUSE_WEIGHT = 0.5
 
         def scene_weight(unit: str) -> float:
@@ -4051,12 +3718,6 @@ class YouTube:
 
         if get_verbose():
             info(f' => Wrote TTS to "{path}"')
-        self._emit_progress(
-            "tts",
-            "Generated voiceover audio.",
-            {"tts_path": path},
-        )
-        self._write_workspace_state()
 
         return path
 
@@ -4171,78 +3832,6 @@ class YouTube:
             "english": "en",
         }
         return language_map.get(normalized)
-
-    def _get_whisper_transcribe_kwargs(self, *, word_timestamps: bool = False) -> dict:
-        """
-        Builds the standard faster-whisper transcription kwargs for the current
-        language configuration.
-
-        Args:
-            word_timestamps (bool): whether to request word timestamps
-
-        Returns:
-            kwargs (dict): transcription kwargs
-        """
-        transcription_language = self._get_transcription_language_code()
-        transcribe_kwargs = {
-            "vad_filter": True,
-            "task": "transcribe",
-            "word_timestamps": bool(word_timestamps),
-        }
-        if transcription_language:
-            transcribe_kwargs["language"] = transcription_language
-        return transcribe_kwargs
-
-    def _transcribe_with_whisper(self, audio_path: str, *, word_timestamps: bool = False):
-        """
-        Runs faster-whisper with a CPU fallback when the configured backend is
-        unavailable or broken.
-
-        Args:
-            audio_path (str): audio file path
-            word_timestamps (bool): whether to request word timestamps
-
-        Returns:
-            result (tuple[list, object, str, str]): segments, info, device, compute type
-        """
-        from faster_whisper import WhisperModel
-
-        requested_device = get_whisper_device()
-        requested_compute_type = get_whisper_compute_type()
-        transcribe_kwargs = self._get_whisper_transcribe_kwargs(
-            word_timestamps=word_timestamps
-        )
-
-        def attempt(device: str, compute_type: str):
-            model = WhisperModel(
-                get_whisper_model(),
-                device=device,
-                compute_type=compute_type,
-            )
-            segments_iter, info = model.transcribe(audio_path, **transcribe_kwargs)
-            return list(segments_iter), info
-
-        try:
-            segments, info = attempt(requested_device, requested_compute_type)
-            return segments, info, requested_device, requested_compute_type
-        except Exception as primary_exc:
-            if requested_device == "cpu" and requested_compute_type == "int8":
-                raise
-
-            warning(
-                f'Whisper backend "{requested_device}/{requested_compute_type}" failed. '
-                f'Falling back to CPU int8: {primary_exc}'
-            )
-            self._emit_progress(
-                "subtitles",
-                "Configured Whisper backend failed, retrying on CPU.",
-                {
-                    "requested_device": requested_device,
-                    "requested_compute_type": requested_compute_type,
-                },
-            )
-            segments, info = attempt("cpu", "int8")
-            return segments, info, "cpu", "int8"
 
     def _contains_arabic_text(self, value: str) -> bool:
         """
@@ -4794,19 +4383,17 @@ class YouTube:
             )
             raise
 
-        self._emit_progress(
-            "subtitles_start",
-            "Generating subtitles with local Whisper...",
-            {
-                "provider": "local_whisper",
-                "requested_device": get_whisper_device(),
-                "requested_compute_type": get_whisper_compute_type(),
-            },
+        model = WhisperModel(
+            get_whisper_model(),
+            device=get_whisper_device(),
+            compute_type=get_whisper_compute_type(),
         )
-        segments, _, used_device, used_compute_type = self._transcribe_with_whisper(
-            audio_path,
-            word_timestamps=False,
-        )
+        transcription_language = self._get_transcription_language_code()
+        transcribe_kwargs = {"vad_filter": True, "task": "transcribe"}
+        if transcription_language:
+            transcribe_kwargs["language"] = transcription_language
+
+        segments, _ = model.transcribe(audio_path, **transcribe_kwargs)
 
         lines = []
         for idx, segment in enumerate(segments, start=1):
@@ -4827,11 +4414,6 @@ class YouTube:
         with open(srt_path, "w", encoding="utf-8") as file:
             file.write(subtitles)
 
-        self._emit_progress(
-            "subtitles",
-            f"Generated subtitles with Whisper on {used_device}/{used_compute_type}.",
-            {"subtitle_entries": len(lines) // 4, "subtitles_path": srt_path},
-        )
         self._record_stt_cost("local_whisper", audio_path, get_whisper_model(), "Local Whisper subtitles")
         return srt_path
 
@@ -4856,7 +4438,6 @@ class YouTube:
         scene_durations = self._get_scene_durations(max_duration)
 
         print(colored("[+] Combining visual assets...", "blue"))
-        self._emit_progress("combine", "Combining visual assets into the final timeline.")
 
         clips = []
         for asset, scene_duration in zip(assets, scene_durations):
@@ -4867,10 +4448,12 @@ class YouTube:
         if crossfade > 0 and len(clips) > 1:
             for i in range(len(clips)):
                 if i > 0:
-                    clips[i] = clips[i].fadein(crossfade)
+                    clips[i] = clips[i].crossfadein(crossfade)
                 if i < len(clips) - 1:
-                    clips[i] = clips[i].fadeout(crossfade)
-        final_clip = concatenate_videoclips(clips, method="compose")
+                    clips[i] = clips[i].crossfadeout(crossfade)
+            final_clip = concatenate_videoclips(clips, method="compose", padding=-crossfade)
+        else:
+            final_clip = concatenate_videoclips(clips, method="compose")
         final_clip = final_clip.set_fps(get_video_fps())
 
         subtitle_overlay_clips = []
@@ -4882,36 +4465,22 @@ class YouTube:
             if not subtitle_entries:
                 raise RuntimeError("Subtitle file was empty after generation.")
             subtitle_overlay_clips = self._build_subtitle_overlay_clips(subtitle_entries)
-            self._emit_progress(
-                "subtitles",
-                f"Prepared {len(subtitle_entries)} subtitle entries.",
-                {"subtitle_entries": len(subtitle_entries), "subtitles_path": subtitles_path},
-            )
         except Exception as e:
             warning(f"Failed to generate subtitles, continuing without subtitles: {e}")
 
-        audio_layers = [tts_clip.set_fps(44100)]
-
+        final_audio = tts_clip.set_fps(44100)
         try:
             random_song = choose_random_song()
             random_song_clip = AudioFileClip(random_song).set_fps(44100)
+
+            # Audio ducking: lower music when voice is active, raise during pauses
             random_song_clip = self._apply_audio_ducking(
                 tts_clip, random_song_clip, voice_vol=0.15, silence_vol=0.4
             )
-            audio_layers.append(random_song_clip)
+            final_audio = CompositeAudioClip([final_audio, random_song_clip])
         except Exception as e:
             warning(f"Failed to add background song, continuing with voiceover only: {e}")
 
-        if get_sound_effects_enabled():
-            try:
-                sfx_clips = self._build_sound_effects_clips(self.tts_path)
-                if sfx_clips:
-                    audio_layers.extend(sfx_clips)
-                    info(f" => Added {len(sfx_clips)} sound effects to the audio mix.")
-            except Exception as e:
-                warning(f"Failed to add sound effects: {e}")
-
-        final_audio = CompositeAudioClip(audio_layers)
         final_clip = final_clip.set_audio(final_audio)
         final_clip = final_clip.set_duration(tts_clip.duration)
 
@@ -4919,11 +4488,6 @@ class YouTube:
             final_clip = CompositeVideoClip([final_clip, *subtitle_overlay_clips])
 
         export_codec, export_ffmpeg_params = self._get_video_export_settings()
-        self._emit_progress(
-            "render",
-            f"Writing final video with {export_codec}.",
-            {"codec": export_codec, "output_path": combined_image_path},
-        )
         final_clip.write_videofile(
             combined_image_path,
             threads=threads,
@@ -4933,56 +4497,8 @@ class YouTube:
         )
 
         success(f'Wrote Video to "{combined_image_path}"')
-        self.video_path = os.path.abspath(combined_image_path)
-        self._emit_progress(
-            "done",
-            "Finished writing the final video.",
-            {"video_path": combined_image_path},
-        )
-        self._write_workspace_state()
 
         return combined_image_path
-
-    def rerender_video_from_workspace(self, workspace_dir: str | None = None) -> str:
-        """
-        Rebuilds the final video from a previously saved workspace without
-        regenerating text, prompts, assets, or TTS.
-
-        Args:
-            workspace_dir (str | None): optional workspace path override
-
-        Returns:
-            path (str): regenerated MP4 path
-        """
-        if workspace_dir:
-            self.load_workspace_state(workspace_dir)
-
-        if not str(getattr(self, "tts_path", "") or "").strip() or not os.path.exists(self.tts_path):
-            raise RuntimeError(
-                "This workspace does not contain a saved voiceover, so the final video cannot be rebuilt."
-            )
-
-        if not self.visual_assets:
-            raise RuntimeError(
-                "This workspace does not contain saved visual assets, so the final video cannot be rebuilt."
-            )
-
-        self._emit_progress(
-            "recovery",
-            "Loaded saved workspace state. Rebuilding the final video from existing assets.",
-            {
-                "workspace_dir": self._get_workspace_dir(),
-                "asset_count": len(self.visual_assets),
-            },
-        )
-        self._write_workspace_state()
-        path = self.combine()
-
-        pricing_report = self._write_pricing_report()
-        if isinstance(getattr(self, "metadata", None), dict):
-            self.metadata["pricing"] = pricing_report
-        self._write_workspace_state()
-        return path
 
     def _ffmpeg_supports_encoder(self, encoder_name: str) -> bool:
         """
@@ -5096,102 +4612,6 @@ class YouTube:
             warning(f"Audio ducking failed, using flat volume: {e}")
             return music_clip.fx(afx.volumex, voice_vol)
 
-    def _build_sound_effects_clips(self, audio_path: str) -> list:
-        """
-        Scans the voiceover audio with Whisper to get word timestamps,
-        then matches trigger words from config to produce timed SFX AudioFileClips.
-
-        Args:
-            audio_path (str): Path to the voiceover WAV file
-
-        Returns:
-            sfx_clips (list): AudioFileClip instances positioned at trigger timestamps
-        """
-        sfx_map = get_sound_effects_map()
-        if not sfx_map:
-            return []
-
-        sfx_volume = get_sound_effects_volume()
-        sfx_offset = get_sound_effects_offset()
-        sfx_dir = os.path.join(ROOT_DIR, "sfx")
-        min_gap = 0.5  # minimum seconds between SFX to avoid overlap
-
-        # Normalize trigger words: strip diacritics and punctuation for matching
-        def strip_word(w: str) -> str:
-            w = re.sub(r"[\u064B-\u065F\u0670]", "", str(w))  # Arabic diacritics
-            return re.sub(r"[.,!?;:،؛؟…\"'()\[\]]", "", w).strip().lower()
-
-        normalized_map = {}
-        for trigger, sfx_file in sfx_map.items():
-            normalized_map[strip_word(trigger)] = sfx_file
-
-        # Get word-level timestamps from Whisper
-        try:
-            from faster_whisper import WhisperModel
-
-            device = get_whisper_device()
-            compute_type = get_whisper_compute_type()
-            try:
-                model = WhisperModel(get_whisper_model(), device=device, compute_type=compute_type)
-            except Exception:
-                model = WhisperModel(get_whisper_model(), device="cpu", compute_type="int8")
-
-            transcription_language = self._get_transcription_language_code()
-            transcribe_kwargs = {"vad_filter": True, "task": "transcribe", "word_timestamps": True}
-            if transcription_language:
-                transcribe_kwargs["language"] = transcription_language
-
-            segments, _ = model.transcribe(audio_path, **transcribe_kwargs)
-
-            words_with_times = []
-            for segment in segments:
-                if segment.words:
-                    for word in segment.words:
-                        words_with_times.append({
-                            "word": strip_word(str(word.word)),
-                            "start": word.start,
-                        })
-        except Exception as e:
-            warning(f"SFX: Whisper word timestamps failed: {e}")
-            return []
-
-        # Match trigger words and build SFX clips
-        sfx_clips = []
-        last_sfx_time = -999.0
-
-        for wt in words_with_times:
-            sfx_file = normalized_map.get(wt["word"])
-            if not sfx_file:
-                continue
-
-            sfx_path = os.path.join(sfx_dir, sfx_file)
-            if not os.path.exists(sfx_path):
-                warning(f"SFX file not found: {sfx_path}")
-                continue
-
-            trigger_time = max(0.0, wt["start"] + sfx_offset)
-
-            # Skip if too close to previous SFX
-            if trigger_time - last_sfx_time < min_gap:
-                continue
-
-            try:
-                sfx_clip = (
-                    AudioFileClip(sfx_path)
-                    .set_fps(44100)
-                    .fx(afx.volumex, sfx_volume)
-                    .set_start(trigger_time)
-                )
-                sfx_clips.append(sfx_clip)
-                last_sfx_time = trigger_time
-
-                if get_verbose():
-                    info(f' => SFX: "{wt["word"]}" @ {trigger_time:.2f}s -> {sfx_file}')
-            except Exception as e:
-                warning(f"SFX: Failed to load {sfx_file}: {e}")
-
-        return sfx_clips
-
     def _render_video_assets(self, tts_instance: TTS) -> str:
         """
         Generates images, audio, and the final video from the current subject
@@ -5210,14 +4630,11 @@ class YouTube:
         self._pixabay_selection_debug = []
 
         # Generate the Metadata
-        self._emit_progress("metadata_start", "Generating metadata...")
         self.generate_metadata()
 
         # Generate the Image Prompts
-        self._emit_progress("prompts_start", "Generating scene image prompts...")
         self.generate_prompts()
 
-        self._emit_progress("assets_start", "Generating visual assets...")
         generated_assets = self._generate_visual_assets()
 
         if generated_assets == 0:
@@ -5231,11 +4648,9 @@ class YouTube:
             )
 
         # Generate the TTS
-        self._emit_progress("tts_start", "Generating voiceover audio...")
         self.generate_script_to_speech(tts_instance)
 
         # Combine everything
-        self._emit_progress("render_start", "Starting final video render...")
         path = self.combine()
 
         if get_verbose():

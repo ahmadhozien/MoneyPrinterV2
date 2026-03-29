@@ -1,5 +1,8 @@
+import contextlib
+import io
 import json
 import os
+import re
 import sys
 import traceback
 from uuid import uuid4
@@ -25,6 +28,7 @@ from llm_provider import list_models, select_model
 
 CONFIG_PATH = os.path.join(APP_ROOT_DIR, "config.json")
 YOUTUBE_DRAFTS_PATH = os.path.join(APP_ROOT_DIR, ".mp", "youtube_drafts.json")
+YOUTUBE_RUNS_PATH = os.path.join(APP_ROOT_DIR, ".mp", "youtube_runs")
 
 
 def load_config() -> dict:
@@ -103,6 +107,207 @@ def get_all_youtube_drafts() -> list[dict]:
         if os.path.exists(draft.get("video_path", ""))
     ]
     return sorted(drafts, key=lambda draft: draft.get("created_at", ""), reverse=True)
+
+
+def load_youtube_run_state(workspace_dir: str) -> dict | None:
+    state_path = os.path.join(os.path.abspath(workspace_dir), "run_state.json")
+    if not os.path.exists(state_path):
+        return None
+
+    try:
+        with open(state_path, "r", encoding="utf-8") as file:
+            payload = json.load(file) or {}
+    except (OSError, json.JSONDecodeError):
+        return None
+
+    payload["workspace_dir"] = os.path.abspath(workspace_dir)
+    return payload
+
+
+def get_youtube_recoverable_runs_for_account(account_id: str) -> list[dict]:
+    if not os.path.isdir(YOUTUBE_RUNS_PATH):
+        return []
+
+    recoverable_runs = []
+    for entry in os.scandir(YOUTUBE_RUNS_PATH):
+        if not entry.is_dir():
+            continue
+        payload = load_youtube_run_state(entry.path)
+        if not payload or payload.get("account_uuid") != account_id:
+            continue
+
+        workspace_dir = payload["workspace_dir"]
+        voiceover_path = payload.get("tts_path", "")
+        if voiceover_path and not os.path.isabs(voiceover_path):
+            voiceover_path = os.path.join(workspace_dir, voiceover_path)
+        visual_assets = payload.get("visual_assets", [])
+        pricing_path = os.path.join(workspace_dir, "pricing.json")
+        final_video_path = payload.get("video_path", "") or os.path.join(workspace_dir, "final_video.mp4")
+        if final_video_path and not os.path.isabs(final_video_path):
+            final_video_path = os.path.join(workspace_dir, final_video_path)
+
+        if not os.path.exists(str(voiceover_path or "")):
+            continue
+        if not isinstance(visual_assets, list) or len(visual_assets) == 0:
+            continue
+        if os.path.exists(pricing_path) and os.path.exists(final_video_path):
+            continue
+
+        payload["voiceover_path"] = os.path.abspath(voiceover_path)
+        payload["final_video_path"] = os.path.abspath(final_video_path)
+        payload["visual_asset_count"] = len(visual_assets)
+        recoverable_runs.append(payload)
+
+    return sorted(
+        recoverable_runs,
+        key=lambda item: str(item.get("updated_at", "")),
+        reverse=True,
+    )
+
+
+def format_recoverable_run_option(run_payload: dict) -> str:
+    subject = str(run_payload.get("subject", "") or "(untitled)").strip()
+    updated_at = str(run_payload.get("updated_at", "") or "").replace("T", " ")
+    return (
+        f"{updated_at or 'Unfinished run'} | "
+        f"{subject[:70]} | "
+        f"{int(run_payload.get('visual_asset_count', 0) or 0)} assets"
+    )
+
+
+ANSI_ESCAPE_RE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+
+
+class StreamlitLogCapture(io.TextIOBase):
+    def __init__(self, placeholder, max_lines: int = 120):
+        self.placeholder = placeholder
+        self.max_lines = max_lines
+        self.lines: list[str] = []
+        self.pending = ""
+
+    def write(self, value):
+        text = ANSI_ESCAPE_RE.sub("", str(value or "")).replace("\r", "\n")
+        if not text:
+            return 0
+
+        self.pending += text
+        while "\n" in self.pending:
+            line, self.pending = self.pending.split("\n", 1)
+            cleaned = line.strip()
+            if cleaned:
+                self.lines.append(cleaned)
+
+        self.lines = self.lines[-self.max_lines:]
+        self._render()
+        return len(text)
+
+    def flush(self):
+        cleaned = self.pending.strip()
+        if cleaned:
+            self.lines.append(cleaned)
+            self.lines = self.lines[-self.max_lines:]
+            self.pending = ""
+            self._render()
+
+    def append(self, message: str) -> None:
+        cleaned = ANSI_ESCAPE_RE.sub("", str(message or "")).strip()
+        if not cleaned:
+            return
+        self.lines.append(cleaned)
+        self.lines = self.lines[-self.max_lines:]
+        self._render()
+
+    def _render(self):
+        if self.placeholder is not None:
+            self.placeholder.code("\n".join(self.lines[-80:]), language="text")
+
+
+def build_youtube_generation_monitor():
+    st.markdown("#### Live Generation")
+    status_placeholder = st.empty()
+    subject_placeholder = st.empty()
+    script_placeholder = st.empty()
+    metadata_placeholder = st.empty()
+    prompts_placeholder = st.empty()
+    assets_placeholder = st.empty()
+    logs_placeholder = st.empty()
+    log_capture = StreamlitLogCapture(logs_placeholder)
+    seen_assets: list[str] = []
+
+    def render_note(title: str, body: str) -> str:
+        return (
+            f'<div class="studio-note" style="margin-bottom:0.75rem;">'
+            f"<strong>{escape(title)}</strong><br>"
+            f'<div style="white-space:pre-wrap;">{escape(body)}</div>'
+            f"</div>"
+        )
+
+    def progress_callback(event: dict) -> None:
+        stage = str((event or {}).get("stage", "")).strip().lower()
+        message = str((event or {}).get("message", "")).strip()
+        payload = (event or {}).get("payload", {}) or {}
+
+        if message:
+            status_placeholder.markdown(
+                render_note("Current Step", message),
+                unsafe_allow_html=True,
+            )
+            log_capture.append(message)
+
+        if payload.get("subject"):
+            subject_placeholder.markdown(
+                render_note("Topic", str(payload.get("subject", "")).strip()),
+                unsafe_allow_html=True,
+            )
+
+        if payload.get("script"):
+            script_placeholder.markdown(
+                render_note("Script", str(payload.get("script", "")).strip()),
+                unsafe_allow_html=True,
+            )
+
+        if payload.get("metadata"):
+            metadata_placeholder.markdown(
+                render_note(
+                    "Metadata",
+                    json.dumps(payload.get("metadata", {}), ensure_ascii=False, indent=2),
+                ),
+                unsafe_allow_html=True,
+            )
+
+        if payload.get("image_prompts"):
+            prompts_text = "\n".join(
+                f"{index + 1}. {prompt}"
+                for index, prompt in enumerate(payload.get("image_prompts", []))
+            )
+            prompts_placeholder.markdown(
+                render_note("Image Prompts", prompts_text),
+                unsafe_allow_html=True,
+            )
+
+        if stage == "visual_asset":
+            scene_index = payload.get("scene_index")
+            scene_label = f"Scene {int(scene_index) + 1}" if isinstance(scene_index, int) else "Scene"
+            asset_line = (
+                f"{scene_label}: {payload.get('source', 'Asset')} "
+                f"{payload.get('asset_type', 'asset')} saved"
+            )
+            seen_assets.append(asset_line)
+            assets_placeholder.markdown(
+                render_note("Visual Assets", "\n".join(seen_assets[-16:])),
+                unsafe_allow_html=True,
+            )
+
+        if stage == "done" and payload.get("video_path"):
+            assets_placeholder.markdown(
+                render_note(
+                    "Final Output",
+                    f'Video written to:\n{payload.get("video_path", "")}',
+                ),
+                unsafe_allow_html=True,
+            )
+
+    return progress_callback, log_capture
 
 
 def inject_app_styles() -> None:
@@ -1579,6 +1784,7 @@ def render_youtube_studio() -> None:
     account = next(account for account in accounts if account["id"] == account_id)
 
     drafts = get_youtube_drafts_for_account(account["id"])
+    recoverable_runs = get_youtube_recoverable_runs_for_account(account["id"])
     preview = st.session_state.get("youtube_preview", {})
     generated = st.session_state.get("youtube_generated_video", {})
     if generated.get("account_id") == account["id"] and generated.get("video_path"):
@@ -1610,6 +1816,7 @@ def render_youtube_studio() -> None:
                 ("Dialect", str(account.get("dialect", "") or "Default")),
                 ("Made for kids", "Yes" if account.get("is_for_kids", get_is_for_kids()) else "No"),
                 ("Drafts", str(len(drafts))),
+                ("Recoverable runs", str(len(recoverable_runs))),
             ],
         )
 
@@ -1705,8 +1912,10 @@ def render_youtube_studio() -> None:
                 st.code(traceback.format_exc())
 
         if col2.button("Generate Full Video", width="stretch"):
+            youtube = None
             try:
                 provider, model = ensure_llm_selected()
+                progress_callback, log_capture = build_youtube_generation_monitor()
                 youtube = YouTube(
                     account["id"],
                     account["nickname"],
@@ -1718,13 +1927,15 @@ def render_youtube_studio() -> None:
                     account.get("is_for_kids"),
                     open_browser=False,
                 )
-                with st.spinner("Generating video assets..."):
+                youtube.set_progress_callback(progress_callback)
+                with st.spinner("Generating video assets..."), contextlib.redirect_stdout(log_capture), contextlib.redirect_stderr(log_capture):
                     if script_mode == "Write manually":
                         if not manual_script.strip():
                             raise RuntimeError("Enter the manual script first.")
                         youtube.generate_video_from_existing_script(TTS(), manual_script, manual_subject)
                     else:
                         youtube.generate_video(TTS())
+                log_capture.flush()
 
                 st.session_state["youtube_preview"] = {
                     "account_id": account["id"],
@@ -1749,6 +1960,11 @@ def render_youtube_studio() -> None:
                 )
             except Exception as exc:
                 st.error(str(exc))
+                if youtube is not None and getattr(youtube, "_workspace_dir", None):
+                    st.info(
+                        "This run's workspace was kept on disk, so you can retry the final render "
+                        f'from saved assets later: {youtube._workspace_dir}'
+                    )
                 with st.expander("Technical details"):
                     st.code(traceback.format_exc())
 
@@ -1782,6 +1998,81 @@ def render_youtube_studio() -> None:
             except Exception as exc:
                 st.error(str(exc))
                 st.code(traceback.format_exc())
+
+        st.markdown("---")
+        render_panel(
+            "Recovery",
+            "If the final video step fails after assets and voiceover were already created, rebuild the MP4 from the saved workspace without paying again for prompts, images, or TTS.",
+            soft=True,
+        )
+        if recoverable_runs:
+            selected_recovery_workspace = st.selectbox(
+                "Recoverable run",
+                options=[run["workspace_dir"] for run in recoverable_runs],
+                format_func=lambda path: format_recoverable_run_option(
+                    next(run for run in recoverable_runs if run["workspace_dir"] == path)
+                ),
+                key=f"youtube_recoverable_run_{account['id']}",
+            )
+            selected_recovery_run = next(
+                run for run in recoverable_runs if run["workspace_dir"] == selected_recovery_workspace
+            )
+            st.markdown(
+                f"""
+                <div class="studio-note">
+                    <strong>Workspace</strong><br>
+                    <div style="white-space:pre-wrap;">{escape(selected_recovery_workspace)}</div>
+                    <br><strong>Subject</strong><br>
+                    <div style="white-space:pre-wrap;">{escape(str(selected_recovery_run.get("subject", "")))}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+            if st.button(
+                "Retry Final Render From Saved Assets",
+                width="stretch",
+                key=f"youtube_retry_render_{account['id']}",
+            ):
+                try:
+                    progress_callback, log_capture = build_youtube_generation_monitor()
+                    youtube = YouTube(
+                        account["id"],
+                        account["nickname"],
+                        account["firefox_profile"],
+                        niche_override,
+                        language_override,
+                        dialect_override,
+                        context_override,
+                        account.get("is_for_kids"),
+                        open_browser=False,
+                    )
+                    youtube.set_progress_callback(progress_callback)
+                    with st.spinner("Rebuilding final video from saved assets..."), contextlib.redirect_stdout(log_capture), contextlib.redirect_stderr(log_capture):
+                        youtube.load_workspace_state(selected_recovery_workspace)
+                        youtube.rerender_video_from_workspace()
+                    log_capture.flush()
+
+                    st.session_state["youtube_preview"] = {
+                        "account_id": account["id"],
+                        "subject": getattr(youtube, "subject", ""),
+                        "script": getattr(youtube, "script", ""),
+                        "metadata": youtube.metadata,
+                    }
+                    st.session_state["youtube_generated_video"] = {
+                        "account_id": account["id"],
+                        "video_path": youtube.video_path,
+                        "metadata": youtube.metadata,
+                        "subject": getattr(youtube, "subject", ""),
+                        "script": getattr(youtube, "script", ""),
+                    }
+                    save_youtube_draft(account["id"], youtube.video_path, youtube.metadata)
+                    st.success("Final video rebuilt from the saved workspace.")
+                except Exception as exc:
+                    st.error(str(exc))
+                    with st.expander("Technical details", expanded=False):
+                        st.code(traceback.format_exc())
+        else:
+            st.info("No recoverable unfinished runs found for this account right now.")
 
     with preview_tab:
         preview_payload = preview if preview.get("account_id") == account["id"] else {}
