@@ -569,7 +569,7 @@ def render_pricing_report(pricing: dict, key_prefix: str = "pricing") -> None:
                 }
             )
         st.markdown("#### Category Summary")
-        st.dataframe(summary_rows, use_container_width=True, hide_index=True, key=f"{key_prefix}_summary")
+        st.dataframe(summary_rows, width="stretch", hide_index=True, key=f"{key_prefix}_summary")
 
     if items:
         item_rows = []
@@ -586,7 +586,7 @@ def render_pricing_report(pricing: dict, key_prefix: str = "pricing") -> None:
                 }
             )
         st.markdown("#### Line Items")
-        st.dataframe(item_rows, use_container_width=True, hide_index=True, key=f"{key_prefix}_items")
+        st.dataframe(item_rows, width="stretch", hide_index=True, key=f"{key_prefix}_items")
 
     if notes:
         st.markdown("#### Notes")
@@ -1289,10 +1289,10 @@ def render_config_tab() -> None:
         with refresh_col:
             refresh_metadata_choices = st.form_submit_button(
                 "Refresh Metadata Choices",
-                use_container_width=True,
+                width="stretch",
             )
         with save_col:
-            submitted = st.form_submit_button("Save Config", use_container_width=True)
+            submitted = st.form_submit_button("Save Config", width="stretch")
 
     if refresh_metadata_choices:
         st.info("Metadata model choices were refreshed for the selected LLM provider and base model.")
@@ -1376,7 +1376,7 @@ def render_account_editor(provider: str) -> None:
                     else False
                 )
 
-            save_button = st.form_submit_button("Save Changes", use_container_width=True)
+            save_button = st.form_submit_button("Save Changes", width="stretch")
 
         if save_button:
             updates = {
@@ -1400,7 +1400,7 @@ def render_account_editor(provider: str) -> None:
         if st.button(
             f"Delete {provider.title()} Account",
             type="secondary",
-            use_container_width=True,
+            width="stretch",
             key=f"delete_{provider}_account",
         ):
             remove_account(provider, selected_id)
@@ -1438,7 +1438,7 @@ def render_account_editor(provider: str) -> None:
                 else False
             )
 
-        create_button = st.form_submit_button(f"Create {provider.title()} Account", use_container_width=True)
+        create_button = st.form_submit_button(f"Create {provider.title()} Account", width="stretch")
 
     if create_button:
         account = {
@@ -1504,7 +1504,7 @@ def render_twitter_studio() -> None:
 
     col1, col2 = st.columns(2)
 
-    if col1.button("Generate Tweet Preview", use_container_width=True):
+    if col1.button("Generate Tweet Preview", width="stretch"):
         try:
             provider, model = ensure_llm_selected()
             twitter = Twitter(
@@ -1522,7 +1522,7 @@ def render_twitter_studio() -> None:
             st.error(str(exc))
             st.code(traceback.format_exc())
 
-    if col2.button("Post Preview to X", use_container_width=True):
+    if col2.button("Post Preview to X", width="stretch"):
         try:
             preview_text = st.session_state.get("twitter_preview_text", "").strip()
             if not preview_text:
@@ -1669,7 +1669,7 @@ def render_youtube_studio() -> None:
 
         col1, col2, col3 = st.columns(3)
 
-        if col1.button("Generate Idea + Script Preview", use_container_width=True):
+        if col1.button("Generate Idea + Script Preview", width="stretch"):
             try:
                 provider, model = ensure_llm_selected()
                 youtube = YouTube(
@@ -1704,7 +1704,7 @@ def render_youtube_studio() -> None:
                 st.error(str(exc))
                 st.code(traceback.format_exc())
 
-        if col2.button("Generate Full Video", use_container_width=True):
+        if col2.button("Generate Full Video", width="stretch"):
             try:
                 provider, model = ensure_llm_selected()
                 youtube = YouTube(
@@ -1752,7 +1752,7 @@ def render_youtube_studio() -> None:
                 with st.expander("Technical details"):
                     st.code(traceback.format_exc())
 
-        if col3.button("Upload Latest Draft", use_container_width=True):
+        if col3.button("Upload Latest Draft", width="stretch"):
             try:
                 generated_for_upload = st.session_state.get("youtube_generated_video")
                 if not generated_for_upload or generated_for_upload.get("account_id") != account["id"]:
@@ -1880,7 +1880,7 @@ def render_youtube_studio() -> None:
                 )
 
                 upload_col, info_col = st.columns([1.2, 0.8])
-                if upload_col.button("Upload Selected Draft", use_container_width=True, key=f"upload_selected_draft_{account['id']}"):
+                if upload_col.button("Upload Selected Draft", width="stretch", key=f"upload_selected_draft_{account['id']}"):
                     try:
                         youtube = YouTube(
                             account["id"],
@@ -1929,7 +1929,7 @@ def render_youtube_studio() -> None:
                     value=preview.get("metadata", {}).get("description", ""),
                     height=120,
                 )
-                import_button = st.form_submit_button("Save As Draft", use_container_width=True)
+                import_button = st.form_submit_button("Save As Draft", width="stretch")
 
             if import_button:
                 normalized_import_path = os.path.abspath(import_video_path.strip())
@@ -2086,7 +2086,7 @@ def render_tiktok_studio() -> None:
 
         if action_col1.button(
             "Generate Idea + Script Preview",
-            use_container_width=True,
+            width="stretch",
             key=f"tiktok_generate_preview_{account['id']}",
         ):
             try:
@@ -2126,7 +2126,7 @@ def render_tiktok_studio() -> None:
 
         if action_col2.button(
             "Generate Full Video For TikTok",
-            use_container_width=True,
+            width="stretch",
             key=f"tiktok_generate_video_{account['id']}",
         ):
             try:
@@ -2269,12 +2269,12 @@ def render_tiktok_studio() -> None:
         default_caption = st.session_state.get(caption_state_key, default_caption)
 
     action_col1, action_col2 = st.columns(2)
-    if action_col1.button("Build Caption From Metadata", use_container_width=True):
+    if action_col1.button("Build Caption From Metadata", width="stretch"):
         rebuilt_caption = tiktok_helper.build_basic_caption(source_metadata)
         st.session_state[caption_state_key] = rebuilt_caption
         st.session_state[caption_editor_key] = rebuilt_caption
 
-    if action_col2.button("Refine Caption With AI", use_container_width=True):
+    if action_col2.button("Refine Caption With AI", width="stretch"):
         try:
             provider, model = ensure_llm_selected()
             refined = tiktok_helper.generate_caption(source_metadata)
@@ -2334,7 +2334,7 @@ def render_tiktok_studio() -> None:
                     key_prefix=f"tiktok_source_pricing_{account['id']}",
                 )
 
-        if st.button("Upload To TikTok", use_container_width=True, key="tiktok_upload_button"):
+        if st.button("Upload To TikTok", width="stretch", key="tiktok_upload_button"):
             try:
                 if not source_path or not os.path.exists(source_path):
                     raise RuntimeError("Choose a valid source video before uploading to TikTok.")

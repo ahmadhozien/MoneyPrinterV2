@@ -51,6 +51,7 @@ DEFAULT_MIN_IMAGE_PROMPTS = 10
 DEFAULT_MAX_IMAGE_PROMPTS = 12
 IMAGE_RATE_LIMIT_RETRIES = 3
 IMAGE_RATE_LIMIT_BACKOFF_SECONDS = 5
+PIXBAY_MIN_SELECTION_SCORE = 65.0
 
 
 class ImageRateLimitError(RuntimeError):
@@ -1755,7 +1756,7 @@ class YouTube:
             "time": "",
             "mood": self._clean_stock_search_query(mood, max_words=2),
             "must_show": must_show[:3],
-            "must_avoid": [],
+            "must_avoid": self._get_default_stock_must_avoid_terms(),
         }
         intent["query_variants"] = self._build_scene_query_variants(
             scene_text,
@@ -1805,7 +1806,7 @@ class YouTube:
             "time": self._clean_stock_search_query(raw_intent.get("time", ""), max_words=3),
             "mood": self._clean_stock_search_query(raw_intent.get("mood", ""), max_words=2) or fallback["mood"],
             "must_show": [],
-            "must_avoid": [],
+            "must_avoid": self._get_default_stock_must_avoid_terms(),
         }
 
         raw_must_show = raw_intent.get("must_show", [])
@@ -1899,6 +1900,7 @@ class YouTube:
                         "- Keep each query between 2 and 6 words.\n"
                         "- Prefer concrete visual search terms for stock footage.\n"
                         "- Avoid brand names, captions, logos, UI terms, and abstract essay language.\n"
+                        "- In must_avoid always include culturally unsafe visuals for Arab audiences such as nudity, revealing clothes, alcohol, and smoking.\n"
                         "- Query types should prioritize literal_scene, subject_action, subject_setting, object_closeup, mood_context, global_topic.\n"
                         f"Global subject: {self.subject}\n"
                         f"Tags: {', '.join(self.metadata.get('tags', []))}\n"
@@ -1982,6 +1984,126 @@ class YouTube:
         }
         return priorities.get(str(variant_type or "").strip().lower(), 3.5)
 
+    def _get_default_stock_must_avoid_terms(self) -> list[str]:
+        """
+        Returns default visual exclusions so stock assets stay suitable for
+        Arab audiences.
+
+        Returns:
+            terms (list[str]): normalized avoid phrases
+        """
+        return [
+            "nudity",
+            "nude body",
+            "revealing clothes",
+            "short dress",
+            "bikini",
+            "lingerie",
+            "alcohol",
+            "beer",
+            "wine",
+            "cocktail",
+            "smoking",
+            "cigarette",
+            "vape",
+            "hookah",
+        ]
+
+    def _find_pixabay_unsafe_content_matches(self, hit: dict) -> list[str]:
+        """
+        Detects explicit Pixabay tags we should reject for cultural-safety
+        reasons before scoring the candidate.
+
+        Args:
+            hit (dict): Pixabay result hit
+
+        Returns:
+            matches (list[str]): matched unsafe terms
+        """
+        unsafe_phrases = {
+            "short dress",
+            "mini dress",
+            "revealing clothes",
+            "revealing clothing",
+            "revealing outfit",
+            "party dress",
+            "club dress",
+            "night club",
+        }
+        unsafe_tokens = {
+            "nudity",
+            "nude",
+            "naked",
+            "topless",
+            "lingerie",
+            "bikini",
+            "swimsuit",
+            "underwear",
+            "bra",
+            "panties",
+            "cleavage",
+            "sexy",
+            "sensual",
+            "seductive",
+            "alcohol",
+            "alcoholic",
+            "beer",
+            "wine",
+            "whiskey",
+            "whisky",
+            "vodka",
+            "champagne",
+            "cocktail",
+            "drunk",
+            "smoking",
+            "cigarette",
+            "cigar",
+            "vape",
+            "vaping",
+            "hookah",
+            "shisha",
+        }
+
+        searchable_text = " ".join(
+            [
+                str(hit.get("tags", "")).strip().lower(),
+                str(hit.get("type", "")).strip().lower(),
+            ]
+        ).strip()
+        tag_tokens = self._tokenize_search_text(searchable_text)
+        matches = [phrase for phrase in sorted(unsafe_phrases) if phrase in searchable_text]
+        matches.extend(token for token in sorted(unsafe_tokens) if token in tag_tokens)
+        return matches
+
+    def _get_pixabay_selection_score(self, candidate: dict | None) -> float:
+        """
+        Normalizes the current Pixabay score onto a 0-100 quality scale.
+
+        Args:
+            candidate (dict | None): Pixabay candidate
+
+        Returns:
+            score (float): normalized quality score
+        """
+        if not isinstance(candidate, dict):
+            return 0.0
+
+        raw_score = float(candidate.get("final_score", candidate.get("base_score", 0.0)) or 0.0)
+        return max(0.0, min(100.0, raw_score))
+
+    def _pixabay_candidate_meets_quality_threshold(self, candidate: dict | None) -> bool:
+        """
+        Returns whether a Pixabay candidate is strong enough to keep instead of
+        falling back to AI generation.
+
+        Args:
+            candidate (dict | None): Pixabay candidate
+
+        Returns:
+            meets_threshold (bool): True when the candidate clears the minimum score
+        """
+        return self._get_pixabay_selection_score(candidate) >= PIXBAY_MIN_SELECTION_SCORE
+
     def _estimate_pixabay_generic_penalty(self, tag_tokens: set[str], relevance_tokens: set[str]) -> float:
         """
         Penalizes candidates whose tags are generic and weakly tied to the scene.
@@ -2032,6 +2154,10 @@ class YouTube:
         """
         query = str(query_variant.get("query", "")).strip()
         if not query:
+            return None
+
+        unsafe_matches = self._find_pixabay_unsafe_content_matches(hit)
+        if unsafe_matches:
             return None
 
         if asset_type == "video":
@@ -2102,6 +2228,7 @@ class YouTube:
             "matched_queries": [query],
             "matched_query_types": [str(query_variant.get("type", "")).strip() or "variant"],
             "base_score": float(score),
+            "selection_score": float(max(0.0, min(100.0, score))),
             "score_breakdown": {
                 "baseline": round(float(baseline_score), 3),
                 "variant_bonus": round(float(variant_bonus), 3),
@@ -2337,6 +2464,7 @@ class YouTube:
             if best_choice is None:
                 continue
 
+            best_choice["selection_score"] = self._get_pixabay_selection_score(best_choice)
             selected[scene_index] = best_choice
             used_candidate_keys.add(best_choice["candidate_key"])
             selected_candidates.append(best_choice)
@@ -2368,6 +2496,9 @@ class YouTube:
             "matched_query_types": candidate.get("matched_query_types", [])[:5],
             "base_score": round(float(candidate.get("base_score", 0.0)), 3),
             "final_score": round(float(candidate.get("final_score", candidate.get("base_score", 0.0))), 3),
+            "selection_score": round(float(self._get_pixabay_selection_score(candidate)), 3),
+            "quality_threshold": round(float(PIXBAY_MIN_SELECTION_SCORE), 3),
+            "meets_quality_threshold": self._pixabay_candidate_meets_quality_threshold(candidate),
             "diversity_penalty": round(float(candidate.get("diversity_penalty", 0.0)), 3),
             "score_breakdown": candidate.get("score_breakdown", {}),
             "diversity_breakdown": candidate.get("diversity_breakdown", {}),
@@ -2440,57 +2571,69 @@ class YouTube:
         for plan in scene_plans:
             scene_index = plan["scene_index"]
             selected_candidate = selected_by_scene.get(scene_index)
+            approved_candidate = selected_candidate if self._pixabay_candidate_meets_quality_threshold(selected_candidate) else None
             selected_summary = None
             local_asset_path = None
+            fallback_reason = ""
 
-            if selected_candidate is not None:
+            if selected_candidate is not None and approved_candidate is None:
+                fallback_reason = (
+                    f"Pixabay score {self._get_pixabay_selection_score(selected_candidate):.1f} "
+                    f"is below the minimum {PIXBAY_MIN_SELECTION_SCORE:.1f}, so this scene will fall back to AI."
+                )
+                selected_summary = self._summarize_pixabay_candidate_for_debug(selected_candidate, selected=False)
+                selected_summary["rejected_for_ai_fallback"] = True
+                selected_summary["rejection_reason"] = fallback_reason
+
+            if approved_candidate is not None:
                 try:
-                    asset_bytes = self._download_url_bytes(selected_candidate["asset_url"])
+                    asset_bytes = self._download_url_bytes(approved_candidate["asset_url"])
                     if asset_bytes:
-                        if selected_candidate["asset_type"] == "video":
+                        if approved_candidate["asset_type"] == "video":
                             filename = (
                                 f"stock_video_{len(self.visual_assets)+1:02d}_"
-                                f"{selected_candidate.get('hit_id') or 'pixabay'}_"
-                                f"{selected_candidate.get('asset_variant') or 'clip'}.mp4"
+                                f"{approved_candidate.get('hit_id') or 'pixabay'}_"
+                                f"{approved_candidate.get('asset_variant') or 'clip'}.mp4"
                             )
                         else:
-                            filename = f"stock_image_{len(self.visual_assets)+1:02d}_{selected_candidate.get('hit_id') or 'pixabay'}.jpg"
+                            filename = f"stock_image_{len(self.visual_assets)+1:02d}_{approved_candidate.get('hit_id') or 'pixabay'}.jpg"
 
                         path = self._persist_binary_asset(
                             asset_bytes,
                             filename,
                             "Pixabay",
-                            selected_candidate["asset_type"],
+                            approved_candidate["asset_type"],
                             scene_index=scene_index,
                         )
-                        self._record_stock_asset_cost("pixabay", selected_candidate["asset_type"], scene_index=scene_index)
+                        self._record_stock_asset_cost("pixabay", approved_candidate["asset_type"], scene_index=scene_index)
                         local_asset_path = path
                         if self.visual_assets and self.visual_assets[-1].get("path") == path:
                             self.visual_assets[-1].update(
                                 {
-                                    "pixabay_hit_id": selected_candidate.get("hit_id"),
-                                    "pixabay_query": selected_candidate.get("best_query"),
-                                    "pixabay_query_type": selected_candidate.get("best_query_type"),
-                                    "pixabay_tags": selected_candidate.get("top_tags", []),
+                                    "pixabay_hit_id": approved_candidate.get("hit_id"),
+                                    "pixabay_query": approved_candidate.get("best_query"),
+                                    "pixabay_query_type": approved_candidate.get("best_query_type"),
+                                    "pixabay_tags": approved_candidate.get("top_tags", []),
                                 }
                             )
                             assets_by_scene[scene_index] = self.visual_assets[-1]
                         else:
                             assets_by_scene[scene_index] = {
-                                "type": selected_candidate["asset_type"],
+                                "type": approved_candidate["asset_type"],
                                 "path": path,
                                 "source": "Pixabay",
                                 "scene_index": scene_index,
                             }
-                        selected_summary = self._summarize_pixabay_candidate_for_debug(selected_candidate, selected=True)
+                        selected_summary = self._summarize_pixabay_candidate_for_debug(approved_candidate, selected=True)
                 except Exception as exc:
                     if get_verbose():
                         warning(f'Failed to download selected Pixabay asset for scene {scene_index + 1}: {exc}')
+                    fallback_reason = f"Pixabay download failed, so this scene will fall back to AI: {exc}"
 
             top_candidates = []
             for candidate in plan.get("candidates", [])[:5]:
-                is_selected = bool(selected_candidate and candidate["candidate_key"] == selected_candidate["candidate_key"])
-                candidate_for_debug = selected_candidate if is_selected else candidate
+                is_selected = bool(approved_candidate and candidate["candidate_key"] == approved_candidate["candidate_key"])
+                candidate_for_debug = approved_candidate if is_selected else candidate
                 top_candidates.append(self._summarize_pixabay_candidate_for_debug(candidate_for_debug, selected=is_selected))
 
             debug_scenes.append(
@@ -2510,6 +2653,9 @@ class YouTube:
                     },
                     "query_variants": plan["scene_intent"].get("query_variants", []),
                     "candidate_count": len(plan.get("candidates", [])),
+                    "quality_threshold": round(float(PIXBAY_MIN_SELECTION_SCORE), 3),
+                    "requires_ai_fallback": scene_index not in assets_by_scene,
+                    "fallback_reason": fallback_reason,
                     "selected_asset": selected_summary,
                     "local_asset_path": local_asset_path,
                     "top_candidates": top_candidates,
@@ -2745,8 +2891,8 @@ class YouTube:
             prompt = self.image_prompts[scene_index] if scene_index < len(self.image_prompts) else self.image_prompts[-1]
             asset_created = scene_index in pixabay_assets_by_scene
 
-            if not asset_created and strategy in ("mixed", "ai_only"):
-                max_ai_assets = target_count if strategy == "ai_only" else min(get_max_ai_assets(), target_count)
+            if not asset_created and strategy in ("mixed", "ai_only", "pixabay_only"):
+                max_ai_assets = target_count
                 if ai_used < max_ai_assets:
                     try:
                         asset_created = bool(self.generate_image(prompt, scene_index=scene_index))
