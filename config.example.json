@@ -22,6 +22,8 @@
   "nanobanana2_api_key": "",
   "nanobanana2_model": "gemini-3.1-flash-image-preview",
   "nanobanana2_aspect_ratio": "9:16",
+  "video_fps": 30,
+  "crossfade_duration": 0.3,
   "youtube_target_duration_seconds": 30,
   "min_image_prompts": 10,
   "max_image_prompts": 12,

@@ -791,6 +791,36 @@ def get_imagemagick_path() -> str:
     with open(os.path.join(ROOT_DIR, "config.json"), "r") as file:
         return json.load(file)["imagemagick_path"]
 
+def get_video_fps() -> int:
+    """
+    Gets the video frame rate. Default is 30. Use 60 for smoother TikTok videos.
+
+    Returns:
+        fps (int): Frames per second (30 or 60)
+    """
+    with open(os.path.join(ROOT_DIR, "config.json"), "r") as file:
+        value = json.load(file).get("video_fps", 30)
+        try:
+            fps = int(value)
+            return fps if fps in (24, 30, 60) else 30
+        except (TypeError, ValueError):
+            return 30
+
+def get_crossfade_duration() -> float:
+    """
+    Gets the crossfade duration in seconds between video scenes.
+    0 means no crossfade (hard cut). Default is 0.3 seconds.
+
+    Returns:
+        duration (float): Crossfade duration in seconds
+    """
+    with open(os.path.join(ROOT_DIR, "config.json"), "r") as file:
+        value = json.load(file).get("crossfade_duration", 0.3)
+        try:
+            return max(0.0, min(1.0, float(value)))
+        except (TypeError, ValueError):
+            return 0.3
+
 def get_script_sentence_length() -> int:
     """
     Gets the forced script's sentence length.
