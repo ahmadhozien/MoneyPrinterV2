@@ -129,6 +129,49 @@ def _extract_openai_output_text(response: dict) -> str:
     raise RuntimeError("OpenAI API returned no text output.")
 
 
+def _extract_openai_usage(response: dict) -> dict:
+    """
+    Extracts normalized token usage from an OpenAI Responses payload.
+
+    Args:
+        response (dict): raw response JSON
+
+    Returns:
+        usage (dict): normalized usage counts
+    """
+    usage = response.get("usage", {}) or {}
+    input_tokens = usage.get("input_tokens", usage.get("prompt_tokens", 0)) or 0
+    output_tokens = usage.get("output_tokens", usage.get("completion_tokens", 0)) or 0
+    total_tokens = usage.get("total_tokens", input_tokens + output_tokens) or 0
+
+    return {
+        "input_tokens": int(input_tokens),
+        "output_tokens": int(output_tokens),
+        "total_tokens": int(total_tokens),
+    }
+
+
+def _extract_ollama_usage(response: dict) -> dict:
+    """
+    Extracts normalized token usage from an Ollama chat payload when present.
+
+    Args:
+        response (dict): raw Ollama response
+
+    Returns:
+        usage (dict): normalized usage counts
+    """
+    input_tokens = response.get("prompt_eval_count", 0) or 0
+    output_tokens = response.get("eval_count", 0) or 0
+    total_tokens = input_tokens + output_tokens
+
+    return {
+        "input_tokens": int(input_tokens),
+        "output_tokens": int(output_tokens),
+        "total_tokens": int(total_tokens),
+    }
+
+
 def list_models(provider: str | None = None) -> list[str]:
     """
     Lists all models available on the active provider.
@@ -192,6 +235,29 @@ def generate_text(
     Returns:
         response (str): generated text
     """
+    return generate_text_result(
+        prompt,
+        model_name=model_name,
+        provider=provider,
+    )["text"]
+
+
+def generate_text_result(
+    prompt: str,
+    model_name: str = None,
+    provider: str | None = None,
+) -> dict:
+    """
+    Generates text and returns normalized usage metadata for pricing/reporting.
+
+    Args:
+        prompt (str): user prompt
+        model_name (str): optional model override
+        provider (str | None): optional provider override
+
+    Returns:
+        result (dict): provider, model, text, usage
+    """
     resolved_provider = _normalize_provider(provider)
     model = model_name or _selected_model
     if not model:
@@ -208,11 +274,21 @@ def generate_text(
                 "input": prompt,
             },
         )
-        return _extract_openai_output_text(response)
+        return {
+            "provider": resolved_provider,
+            "model": model,
+            "text": _extract_openai_output_text(response),
+            "usage": _extract_openai_usage(response),
+        }
 
     response = _ollama_client().chat(
         model=model,
         messages=[{"role": "user", "content": prompt}],
     )
 
-    return response["message"]["content"].strip()
+    return {
+        "provider": resolved_provider,
+        "model": model,
+        "text": response["message"]["content"].strip(),
+        "usage": _extract_ollama_usage(response),
+    }

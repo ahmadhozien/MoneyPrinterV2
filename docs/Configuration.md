@@ -13,14 +13,26 @@ All your configurations will be in a file in the root directory, called `config.
 - `openai_base_url`: `string` - Base URL for the OpenAI API (default: `https://api.openai.com/v1`).
 - `openai_api_key`: `string` - OpenAI API key. If empty, MPV2 falls back to the `OPENAI_API_KEY` environment variable.
 - `openai_model`: `string` - OpenAI model used when `llm_provider` is `openai` (default example: `gpt-5-mini`).
+- `image_provider`: `string` - Image generation provider. Supported values: `nanobanana2`, `openai`, `openrouter`.
+- `asset_strategy`: `string` - Visual sourcing strategy for videos. Supported values: `mixed`, `pixabay_only`, `ai_only`. `mixed` uses Pixabay stock first and only falls back to a limited number of AI-generated visuals.
+- `max_ai_assets`: `number` - Maximum number of AI-generated visuals allowed per video when `asset_strategy` is `mixed` (default: `2`).
+- `openai_image_model`: `string` - OpenAI image model used when `image_provider` is `openai` (default example: `gpt-image-1`).
+- `openai_image_quality`: `string` - OpenAI image quality setting (`low`, `medium`, or `high`).
+- `openrouter_api_key`: `string` - OpenRouter API key. If empty, MPV2 falls back to the `OPENROUTER_API_KEY` environment variable.
+- `openrouter_image_model`: `string` - OpenRouter image model used when `image_provider` is `openrouter` (default example: `black-forest-labs/flux.2-flex`).
+- `pixabay_api_key`: `string` - Pixabay API key for free stock image/video lookup. If empty, Pixabay-based strategies will not be able to fetch stock media.
 - `twitter_language`: `string` - The base language that will be used to generate & post tweets.
 - `twitter_dialect`: `string` - Optional dialect/local style for tweets, for example `Egyptian Arabic`, `Gulf Arabic`, or `Moroccan Darija`.
 - `nanobanana2_api_base_url`: `string` - Nano Banana 2 API base URL (default: `https://generativelanguage.googleapis.com/v1beta`).
 - `nanobanana2_api_key`: `string` - API key for Nano Banana 2 (Gemini image API). If empty, MPV2 falls back to environment variable `GEMINI_API_KEY`.
 - `nanobanana2_model`: `string` - Nano Banana 2 model name (default: `gemini-3.1-flash-image-preview`).
 - `nanobanana2_aspect_ratio`: `string` - Aspect ratio for generated images (default: `9:16`).
+- `youtube_target_duration_seconds`: `number` - Target spoken runtime for generated short-form videos in seconds. This guides script generation (default: `30`). Set `0` to disable runtime targeting.
+- `min_image_prompts`: `number` - Minimum number of generated image prompts per video (default: `10`).
+- `max_image_prompts`: `number` - Maximum number of generated image prompts per video (default: `12`).
+- `pixabay_results_per_query`: `number` - Number of Pixabay search results to inspect per query while sourcing stock visuals (default: `6`).
 - `threads`: `number` - The amount of threads that will be used to execute operations, e.g. writing to a file using MoviePy.
-- `is_for_kids`: `boolean` - If `true`, the application will upload the video to YouTube Shorts as a video for kids.
+- `is_for_kids`: `boolean` - Legacy global fallback for YouTube uploads. Newer builds store this per YouTube account, and this config value is only used when an older account does not yet have its own `is_for_kids` setting.
 - `google_maps_scraper`: `string` - The URL to the Google Maps scraper. This will be used to scrape Google Maps for local businesses. It is recommended to use the default value.
 - `zip_url`: `string` - The URL to the ZIP file that contains the to be used Songs for the YouTube Shorts Automater.
 - `email`: `object`:
@@ -39,6 +51,15 @@ All your configurations will be in a file in the root directory, called `config.
 - `whisper_device`: `string` - Device for local Whisper (`auto`, `cpu`, `cuda`).
 - `whisper_compute_type`: `string` - Compute type for local Whisper (`int8`, `float16`, etc.).
 - `assembly_ai_api_key`: `string` - Your Assembly AI API key. Get yours from [here](https://www.assemblyai.com/app/).
+- `tts_provider`: `string` - Text-to-speech provider. Supported values: `auto`, `openai`, `kitten`. `auto` prefers OpenAI for Arabic when an OpenAI API key is configured.
+- `openai_tts_model`: `string` - OpenAI TTS model used when `tts_provider` resolves to OpenAI (default example: `gpt-4o-mini-tts`).
+- `openai_tts_voice`: `string` - OpenAI TTS voice used when `tts_provider` resolves to OpenAI (default example: `onyx`).
+- `subtitle_font`: `string` - Font file from the `fonts/` folder used for burned-in subtitles (default: `bold_font.ttf`).
+- `subtitle_font_size`: `number` - Subtitle font size for burned-in subtitles (default: `84`).
+- `subtitle_color`: `string` - Subtitle text color in hex (default: `#FFF7D6`).
+- `subtitle_stroke_color`: `string` - Subtitle outline color in hex (default: `#000000`).
+- `subtitle_stroke_width`: `number` - Subtitle outline width (default: `6`).
+- `youtube_metadata_model`: `string` - Optional cheaper model override for YouTube title/description/hashtags/tags generation. If empty and `llm_provider` is `openai`, MPV2 automatically uses `gpt-5-nano` for this metadata step to save credits.
 - `tts_voice`: `string` - Voice for KittenTTS text-to-speech. Default is `Jasper`. Options: `Bella`, `Jasper`, `Luna`, `Bruno`, `Rosie`, `Hugo`, `Kiki`, `Leo`.
 - `font`: `string` - The font that will be used to generate images. This should be a `.ttf` file in the `fonts/` directory.
 - `imagemagick_path`: `string` - The path to the ImageMagick binary. This is used by MoviePy to manipulate images. Install ImageMagick from [here](https://imagemagick.org/script/download.php) and set the path to the `magick.exe` on Windows, or on Linux/MacOS the path to `convert` (usually /usr/bin/convert).
@@ -57,12 +78,24 @@ All your configurations will be in a file in the root directory, called `config.
   "openai_base_url": "https://api.openai.com/v1",
   "openai_api_key": "",
   "openai_model": "gpt-5-mini",
+  "image_provider": "nanobanana2",
+  "asset_strategy": "mixed",
+  "max_ai_assets": 2,
+  "openai_image_model": "gpt-image-1",
+  "openai_image_quality": "low",
+  "openrouter_api_key": "",
+  "openrouter_image_model": "black-forest-labs/flux.2-flex",
+  "pixabay_api_key": "",
   "twitter_language": "English",
   "twitter_dialect": "",
   "nanobanana2_api_base_url": "https://generativelanguage.googleapis.com/v1beta",
   "nanobanana2_api_key": "",
   "nanobanana2_model": "gemini-3.1-flash-image-preview",
   "nanobanana2_aspect_ratio": "9:16",
+  "youtube_target_duration_seconds": 30,
+  "min_image_prompts": 10,
+  "max_image_prompts": 12,
+  "pixabay_results_per_query": 6,
   "threads": 2,
   "zip_url": "",
   "is_for_kids": false,
@@ -82,6 +115,15 @@ All your configurations will be in a file in the root directory, called `config.
   "whisper_device": "auto",
   "whisper_compute_type": "int8",
   "assembly_ai_api_key": "",
+  "tts_provider": "auto",
+  "openai_tts_model": "gpt-4o-mini-tts",
+  "openai_tts_voice": "onyx",
+  "subtitle_font": "bold_font.ttf",
+  "subtitle_font_size": 84,
+  "subtitle_color": "#FFF7D6",
+  "subtitle_stroke_color": "#000000",
+  "subtitle_stroke_width": 6,
+  "youtube_metadata_model": "",
   "tts_voice": "Jasper",
   "font": "bold_font.ttf",
   "imagemagick_path": "Path to magick.exe or on linux/macOS just /usr/bin/convert",
@@ -93,6 +135,8 @@ All your configurations will be in a file in the root directory, called `config.
 
 - `GEMINI_API_KEY`: used when `nanobanana2_api_key` is empty.
 - `OPENAI_API_KEY`: used when `openai_api_key` is empty.
+- `OPENROUTER_API_KEY`: used when `openrouter_api_key` is empty.
+- `PIXABAY_API_KEY`: used when `pixabay_api_key` is empty.
 
 Example:
 

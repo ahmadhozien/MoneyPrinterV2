@@ -11,6 +11,8 @@ selenium
 ollama
 moviepy
 Pillow>=10.0.0
+arabic-reshaper
+python-bidi
 yagmail
 assemblyai
 faster-whisper

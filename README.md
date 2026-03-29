@@ -24,6 +24,7 @@ MPV2 (MoneyPrinter Version 2) is, as the name suggests, the second version of th
 
 - [x] Twitter Bot (with CRON Jobs => `scheduler`)
 - [x] YouTube Shorts Automater (with CRON Jobs => `scheduler`)
+- [x] TikTok uploader for generated short-form videos
 - [x] Affiliate Marketing (Amazon + Twitter)
 - [x] Find local businesses & cold outreach
 
@@ -72,6 +73,18 @@ You can also run the first Streamlit-based GUI:
 
 ```bash
 streamlit run app_gui.py
+```
+
+On Windows, you can also use the included launcher scripts:
+
+```bash
+run_gui.bat
+```
+
+or:
+
+```powershell
+.\run_gui.ps1
 ```
 
 ## Documentation

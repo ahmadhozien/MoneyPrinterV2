@@ -8,12 +8,24 @@
   "openai_base_url": "https://api.openai.com/v1",
   "openai_api_key": "",
   "openai_model": "gpt-5-mini",
+  "image_provider": "nanobanana2",
+  "asset_strategy": "mixed",
+  "max_ai_assets": 2,
+  "openai_image_model": "gpt-image-1",
+  "openai_image_quality": "low",
+  "openrouter_api_key": "",
+  "openrouter_image_model": "black-forest-labs/flux.2-flex",
+  "pixabay_api_key": "",
   "twitter_language": "English",
   "twitter_dialect": "",
   "nanobanana2_api_base_url": "https://generativelanguage.googleapis.com/v1beta",
   "nanobanana2_api_key": "",
   "nanobanana2_model": "gemini-3.1-flash-image-preview",
   "nanobanana2_aspect_ratio": "9:16",
+  "youtube_target_duration_seconds": 30,
+  "min_image_prompts": 10,
+  "max_image_prompts": 12,
+  "pixabay_results_per_query": 6,
   "threads": 2,
   "zip_url": "",
   "is_for_kids": false,
@@ -33,6 +45,120 @@
   "whisper_device": "auto",
   "whisper_compute_type": "int8",
   "assembly_ai_api_key": "",
+  "tts_provider": "auto",
+  "openai_tts_model": "gpt-4o-mini-tts",
+  "openai_tts_voice": "onyx",
+  "subtitle_font": "bold_font.ttf",
+  "subtitle_mode": "word_by_word",
+  "subtitle_font_english": "Oswald-VariableFont_wght.ttf",
+  "subtitle_font_arabic": "Lalezar-Regular.ttf",
+  "subtitle_font_size": 84,
+  "subtitle_color": "#FFF7D6",
+  "subtitle_stroke_color": "#000000",
+  "subtitle_stroke_width": 6,
+  "youtube_metadata_model": "",
+  "pricing": {
+    "currency": "USD",
+    "text_generation": {
+      "openai": {
+        "models": {
+          "gpt-5-mini": {
+            "input_per_1m_tokens": 0.25,
+            "output_per_1m_tokens": 2.0
+          },
+          "gpt-5-nano": {
+            "input_per_1m_tokens": 0.05,
+            "output_per_1m_tokens": 0.4
+          },
+          "gpt-4o-mini": {
+            "input_per_1m_tokens": 0.15,
+            "output_per_1m_tokens": 0.6
+          }
+        }
+      },
+      "ollama": {
+        "models": {
+          "default": {
+            "input_per_1m_tokens": 0.0,
+            "output_per_1m_tokens": 0.0
+          }
+        }
+      }
+    },
+    "image_generation": {
+      "openai": {
+        "models": {
+          "gpt-image-1": {
+            "qualities": {
+              "low": 0.016,
+              "medium": 0.063,
+              "high": 0.25
+            }
+          }
+        }
+      },
+      "nanobanana2": {
+        "models": {
+          "gemini-3.1-flash-image-preview": {
+            "per_image": 0.039
+          }
+        }
+      },
+      "openrouter": {
+        "models": {
+          "default": {
+            "per_image": 0.0
+          }
+        }
+      },
+      "pixabay": {
+        "models": {
+          "default": {
+            "per_asset": 0.0
+          }
+        }
+      }
+    },
+    "tts": {
+      "openai": {
+        "models": {
+          "gpt-4o-mini-tts": {
+            "per_minute_audio": 0.015
+          }
+        }
+      },
+      "kitten": {
+        "models": {
+          "default": {
+            "per_minute_audio": 0.0
+          }
+        }
+      }
+    },
+    "stt": {
+      "script_based": {
+        "models": {
+          "default": {
+            "per_minute_audio": 0.0
+          }
+        }
+      },
+      "local_whisper": {
+        "models": {
+          "default": {
+            "per_minute_audio": 0.0
+          }
+        }
+      },
+      "third_party_assemblyai": {
+        "models": {
+          "default": {
+            "per_minute_audio": 0.0025
+          }
+        }
+      }
+    }
+  },
   "tts_voice": "Jasper",
   "font": "bold_font.ttf",
   "imagemagick_path": "Path to magick.exe or on linux/macOS just /usr/bin/convert",

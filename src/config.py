@@ -1,11 +1,128 @@
 import os
 import sys
 import json
+from copy import deepcopy
 import srt_equalizer
 
 from termcolor import colored
 
 ROOT_DIR = os.path.dirname(sys.path[0])
+
+DEFAULT_PRICING_CONFIG = {
+    "currency": "USD",
+    "text_generation": {
+        "openai": {
+            "models": {
+                "gpt-5-mini": {
+                    "input_per_1m_tokens": 0.25,
+                    "output_per_1m_tokens": 2.00,
+                },
+                "gpt-5-nano": {
+                    "input_per_1m_tokens": 0.05,
+                    "output_per_1m_tokens": 0.40,
+                },
+                "gpt-4o-mini": {
+                    "input_per_1m_tokens": 0.15,
+                    "output_per_1m_tokens": 0.60,
+                },
+                "default": {
+                    "input_per_1m_tokens": 0.00,
+                    "output_per_1m_tokens": 0.00,
+                },
+            }
+        },
+        "ollama": {
+            "models": {
+                "default": {
+                    "input_per_1m_tokens": 0.00,
+                    "output_per_1m_tokens": 0.00,
+                }
+            }
+        },
+    },
+    "image_generation": {
+        "openai": {
+            "models": {
+                "gpt-image-1": {
+                    "qualities": {
+                        "low": 0.016,
+                        "medium": 0.063,
+                        "high": 0.25,
+                    }
+                },
+                "default": {"per_image": 0.00},
+            }
+        },
+        "nanobanana2": {
+            "models": {
+                "gemini-3.1-flash-image-preview": {"per_image": 0.039},
+                "default": {"per_image": 0.039},
+            }
+        },
+        "openrouter": {
+            "models": {
+                "default": {"per_image": 0.00}
+            }
+        },
+        "pixabay": {
+            "models": {
+                "default": {"per_asset": 0.00}
+            }
+        },
+    },
+    "tts": {
+        "openai": {
+            "models": {
+                "gpt-4o-mini-tts": {"per_minute_audio": 0.015},
+                "default": {"per_minute_audio": 0.015},
+            }
+        },
+        "kitten": {
+            "models": {
+                "default": {"per_minute_audio": 0.00}
+            }
+        },
+    },
+    "stt": {
+        "script_based": {
+            "models": {
+                "default": {"per_minute_audio": 0.00}
+            }
+        },
+        "local_whisper": {
+            "models": {
+                "default": {"per_minute_audio": 0.00}
+            }
+        },
+        "third_party_assemblyai": {
+            "models": {
+                "default": {"per_minute_audio": 0.0025}
+            }
+        },
+    },
+}
+
+
+def _deep_merge_dicts(base: dict, overrides: dict) -> dict:
+    """
+    Deep-merges dictionary overrides into a base dictionary.
+
+    Args:
+        base (dict): base dictionary
+        overrides (dict): user overrides
+
+    Returns:
+        merged (dict): merged dictionary
+    """
+    merged = deepcopy(base)
+
+    for key, value in (overrides or {}).items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_merge_dicts(merged[key], value)
+        else:
+            merged[key] = value
+
+    return merged
 
 def assert_folder_structure() -> None:
     """
@@ -176,6 +293,37 @@ def get_nanobanana2_api_base_url() -> str:
             "https://generativelanguage.googleapis.com/v1beta",
         )
 
+def get_image_provider() -> str:
+    """
+    Gets the configured image generation provider.
+
+    Returns:
+        provider (str): image provider name
+    """
+    with open(os.path.join(ROOT_DIR, "config.json"), "r") as file:
+        return json.load(file).get("image_provider", "nanobanana2").strip().lower() or "nanobanana2"
+
+def get_openrouter_api_key() -> str:
+    """
+    Gets the OpenRouter API key.
+
+    Returns:
+        key (str): API key
+    """
+    with open(os.path.join(ROOT_DIR, "config.json"), "r") as file:
+        configured = json.load(file).get("openrouter_api_key", "")
+        return configured or os.environ.get("OPENROUTER_API_KEY", "")
+
+def get_openrouter_image_model() -> str:
+    """
+    Gets the OpenRouter image model name.
+
+    Returns:
+        model (str): image model name
+    """
+    with open(os.path.join(ROOT_DIR, "config.json"), "r") as file:
+        return json.load(file).get("openrouter_image_model", "black-forest-labs/flux.2-flex")
+
 def get_nanobanana2_api_key() -> str:
     """
     Gets the Nano Banana 2 API key.
@@ -206,6 +354,132 @@ def get_nanobanana2_aspect_ratio() -> str:
     """
     with open(os.path.join(ROOT_DIR, "config.json"), "r") as file:
         return json.load(file).get("nanobanana2_aspect_ratio", "9:16")
+
+def get_openai_image_model() -> str:
+    """
+    Gets the OpenAI image model name.
+
+    Returns:
+        model (str): image model name
+    """
+    with open(os.path.join(ROOT_DIR, "config.json"), "r") as file:
+        return json.load(file).get("openai_image_model", "gpt-image-1")
+
+def get_openai_image_quality() -> str:
+    """
+    Gets the OpenAI image quality setting.
+
+    Returns:
+        quality (str): image quality
+    """
+    with open(os.path.join(ROOT_DIR, "config.json"), "r") as file:
+        return json.load(file).get("openai_image_quality", "low")
+
+def get_pricing_config() -> dict:
+    """
+    Gets the pricing configuration used for per-run cost estimates.
+
+    Returns:
+        pricing (dict): merged pricing configuration
+    """
+    with open(os.path.join(ROOT_DIR, "config.json"), "r", encoding="utf-8") as file:
+        configured = json.load(file).get("pricing", {})
+
+    if not isinstance(configured, dict):
+        configured = {}
+
+    return _deep_merge_dicts(DEFAULT_PRICING_CONFIG, configured)
+
+def get_min_image_prompts() -> int:
+    """
+    Gets the minimum number of image prompts to request for a generated video.
+
+    Returns:
+        count (int): minimum prompt count
+    """
+    with open(os.path.join(ROOT_DIR, "config.json"), "r") as file:
+        value = json.load(file).get("min_image_prompts", 10)
+        try:
+            return max(1, int(value))
+        except (TypeError, ValueError):
+            return 10
+
+def get_max_image_prompts() -> int:
+    """
+    Gets the maximum number of image prompts to request for a generated video.
+
+    Returns:
+        count (int): maximum prompt count
+    """
+    with open(os.path.join(ROOT_DIR, "config.json"), "r") as file:
+        value = json.load(file).get("max_image_prompts", 12)
+        try:
+            return max(1, int(value))
+        except (TypeError, ValueError):
+            return 12
+
+def get_youtube_target_duration_seconds() -> int:
+    """
+    Gets the target spoken runtime for generated short-form videos.
+
+    Returns:
+        seconds (int): target runtime in seconds
+    """
+    with open(os.path.join(ROOT_DIR, "config.json"), "r") as file:
+        value = json.load(file).get("youtube_target_duration_seconds", 30)
+        try:
+            return max(0, int(value))
+        except (TypeError, ValueError):
+            return 30
+
+def get_pixabay_api_key() -> str:
+    """
+    Gets the Pixabay API key.
+
+    Returns:
+        key (str): API key
+    """
+    with open(os.path.join(ROOT_DIR, "config.json"), "r") as file:
+        configured = json.load(file).get("pixabay_api_key", "")
+        return configured or os.environ.get("PIXABAY_API_KEY", "")
+
+def get_asset_strategy() -> str:
+    """
+    Gets the configured media sourcing strategy for generated videos.
+
+    Returns:
+        strategy (str): asset strategy
+    """
+    with open(os.path.join(ROOT_DIR, "config.json"), "r") as file:
+        return json.load(file).get("asset_strategy", "mixed").strip().lower() or "mixed"
+
+def get_max_ai_assets() -> int:
+    """
+    Gets the maximum number of AI-generated visual assets to use per video.
+
+    Returns:
+        count (int): max AI assets
+    """
+    with open(os.path.join(ROOT_DIR, "config.json"), "r") as file:
+        value = json.load(file).get("max_ai_assets", 2)
+        try:
+            return max(0, int(value))
+        except (TypeError, ValueError):
+            return 2
+
+def get_pixabay_results_per_query() -> int:
+    """
+    Gets the number of Pixabay results to inspect per query.
+
+    Returns:
+        count (int): results per query
+    """
+    with open(os.path.join(ROOT_DIR, "config.json"), "r") as file:
+        value = json.load(file).get("pixabay_results_per_query", 6)
+        try:
+            return min(20, max(3, int(value)))
+        except (TypeError, ValueError):
+            return 6
 
 def get_threads() -> int:
     """
@@ -297,6 +571,46 @@ def get_tts_voice() -> str:
     with open(os.path.join(ROOT_DIR, "config.json"), "r") as file:
         return json.load(file).get("tts_voice", "Jasper")
 
+def get_tts_provider() -> str:
+    """
+    Gets the configured TTS provider.
+
+    Returns:
+        provider (str): provider name
+    """
+    with open(os.path.join(ROOT_DIR, "config.json"), "r") as file:
+        return json.load(file).get("tts_provider", "auto").strip().lower() or "auto"
+
+def get_openai_tts_model() -> str:
+    """
+    Gets the configured OpenAI TTS model.
+
+    Returns:
+        model (str): model name
+    """
+    with open(os.path.join(ROOT_DIR, "config.json"), "r") as file:
+        return json.load(file).get("openai_tts_model", "gpt-4o-mini-tts")
+
+def get_openai_tts_voice() -> str:
+    """
+    Gets the configured OpenAI TTS voice.
+
+    Returns:
+        voice (str): voice name
+    """
+    with open(os.path.join(ROOT_DIR, "config.json"), "r") as file:
+        return json.load(file).get("openai_tts_voice", "coral")
+
+def get_youtube_metadata_model() -> str:
+    """
+    Gets the configured lightweight model override for YouTube metadata.
+
+    Returns:
+        model (str): model name or empty string
+    """
+    with open(os.path.join(ROOT_DIR, "config.json"), "r") as file:
+        return json.load(file).get("youtube_metadata_model", "")
+
 def get_assemblyai_api_key() -> str:
     """
     Gets the AssemblyAI API key.
@@ -369,6 +683,94 @@ def get_font() -> str:
     """
     with open(os.path.join(ROOT_DIR, "config.json"), "r") as file:
         return json.load(file)["font"]
+
+def get_subtitle_font() -> str:
+    """
+    Gets the subtitle font from the config file.
+
+    Returns:
+        font (str): subtitle font filename
+    """
+    with open(os.path.join(ROOT_DIR, "config.json"), "r") as file:
+        return json.load(file).get("subtitle_font", get_font())
+
+def get_subtitle_font_english() -> str:
+    """
+    Gets the subtitle font to use for English/Latin subtitles.
+
+    Returns:
+        font (str): english subtitle font filename
+    """
+    with open(os.path.join(ROOT_DIR, "config.json"), "r") as file:
+        return json.load(file).get("subtitle_font_english", get_subtitle_font())
+
+def get_subtitle_font_arabic() -> str:
+    """
+    Gets the subtitle font to use for Arabic subtitles.
+
+    Returns:
+        font (str): arabic subtitle font filename
+    """
+    with open(os.path.join(ROOT_DIR, "config.json"), "r") as file:
+        return json.load(file).get("subtitle_font_arabic", get_subtitle_font())
+
+def get_subtitle_mode() -> str:
+    """
+    Gets the subtitle timing/render mode.
+
+    Returns:
+        mode (str): subtitle mode
+    """
+    with open(os.path.join(ROOT_DIR, "config.json"), "r") as file:
+        return json.load(file).get("subtitle_mode", "word_by_word").strip().lower() or "word_by_word"
+
+def get_subtitle_font_size() -> int:
+    """
+    Gets the subtitle font size.
+
+    Returns:
+        size (int): subtitle font size
+    """
+    with open(os.path.join(ROOT_DIR, "config.json"), "r") as file:
+        value = json.load(file).get("subtitle_font_size", 84)
+        try:
+            return max(24, int(value))
+        except (TypeError, ValueError):
+            return 84
+
+def get_subtitle_color() -> str:
+    """
+    Gets the subtitle text color.
+
+    Returns:
+        color (str): subtitle color
+    """
+    with open(os.path.join(ROOT_DIR, "config.json"), "r") as file:
+        return json.load(file).get("subtitle_color", "#FFF7D6")
+
+def get_subtitle_stroke_color() -> str:
+    """
+    Gets the subtitle stroke color.
+
+    Returns:
+        color (str): stroke color
+    """
+    with open(os.path.join(ROOT_DIR, "config.json"), "r") as file:
+        return json.load(file).get("subtitle_stroke_color", "#000000")
+
+def get_subtitle_stroke_width() -> int:
+    """
+    Gets the subtitle stroke width.
+
+    Returns:
+        width (int): stroke width
+    """
+    with open(os.path.join(ROOT_DIR, "config.json"), "r") as file:
+        value = json.load(file).get("subtitle_stroke_width", 6)
+        try:
+            return max(0, int(value))
+        except (TypeError, ValueError):
+            return 6
 
 def get_fonts_dir() -> str:
     """

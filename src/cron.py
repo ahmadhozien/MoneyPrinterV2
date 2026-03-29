@@ -77,7 +77,10 @@ def main():
                     acc["nickname"],
                     acc["firefox_profile"],
                     acc["niche"],
-                    acc["language"]
+                    acc["language"],
+                    acc.get("dialect", ""),
+                    acc.get("character_context", ""),
+                    acc.get("is_for_kids"),
                 )
                 youtube.generate_video(tts)
                 youtube.upload_video()
