@@ -9,3 +9,6 @@ niche.txt
 auto.sh
 .DS_Store
 *.mp4
+*.tmp
+*.tmp.*
+.claude/

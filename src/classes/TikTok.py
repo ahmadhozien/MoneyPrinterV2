@@ -1,7 +1,6 @@
 import os
 import time
 import json
-import subprocess
 
 from cache import get_tiktok_cache_path
 from config import get_headless, get_llm_provider, get_verbose, get_youtube_metadata_model
@@ -72,21 +71,7 @@ class TikTok:
 
     def _assert_profile_is_available(self, profile_path: str) -> None:
         lock_path = os.path.join(profile_path, "parent.lock")
-        if not os.path.exists(lock_path):
-            return
-
-        try:
-            result = subprocess.run(
-                ["tasklist", "/FI", "IMAGENAME eq firefox.exe"],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            firefox_running = "firefox.exe" in result.stdout.lower()
-        except Exception:
-            firefox_running = True
-
-        if firefox_running:
+        if os.path.exists(lock_path):
             raise RuntimeError(
                 "The selected Firefox profile is currently in use. Close Firefox completely and try again."
             )

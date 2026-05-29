@@ -5,11 +5,23 @@ import time
 import os
 import io
 import hashlib
+import tempfile
 import requests
 import assemblyai as aai
 import subprocess
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
+from PIL import features as pil_features
+
+try:
+    import arabic_reshaper
+except Exception:
+    arabic_reshaper = None
+
+try:
+    from bidi.algorithm import get_display as bidi_get_display
+except Exception:
+    bidi_get_display = None
 
 from utils import *
 from cache import *
@@ -22,6 +34,7 @@ from constants import *
 from typing import List
 from moviepy.editor import *
 from termcolor import colored
+from proglog import ProgressBarLogger
 from selenium_firefox import *
 from selenium import webdriver
 from moviepy.video.fx.all import crop
@@ -52,6 +65,7 @@ DEFAULT_MAX_IMAGE_PROMPTS = 12
 IMAGE_RATE_LIMIT_RETRIES = 3
 IMAGE_RATE_LIMIT_BACKOFF_SECONDS = 5
 PIXBAY_MIN_SELECTION_SCORE = 65.0
+VISUAL_ASSET_RETRY_ROUNDS = 2
 
 
 class ImageRateLimitError(RuntimeError):
@@ -149,6 +163,8 @@ class YouTube:
         self._cost_notes = []
         self._pixabay_selection_debug = []
         self._progress_callback = None
+        self._manual_metadata_locked = False
+        self._manual_scene_data_locked = False
 
         # Initialize the Firefox profile
         self.options: Options = Options()
@@ -188,21 +204,7 @@ class YouTube:
             None
         """
         lock_path = os.path.join(profile_path, "parent.lock")
-        if not os.path.exists(lock_path):
-            return
-
-        try:
-            result = subprocess.run(
-                ["tasklist", "/FI", "IMAGENAME eq firefox.exe"],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            firefox_running = "firefox.exe" in result.stdout.lower()
-        except Exception:
-            firefox_running = True
-
-        if firefox_running:
+        if os.path.exists(lock_path):
             raise RuntimeError(
                 "The selected Firefox profile is currently in use. Close Firefox completely and try again."
             )
@@ -289,6 +291,31 @@ class YouTube:
         result = generate_text_result(prompt, model_name=model_name)
         self._record_text_generation_cost(
             provider=result.get("provider", get_llm_provider()),
+            model=result.get("model", model_name or get_configured_llm_model()),
+            usage=result.get("usage", {}),
+        )
+        return result["text"]
+
+    def generate_response_with_provider(
+        self,
+        prompt: str,
+        model_name: str = None,
+        provider: str | None = None,
+    ) -> str:
+        """
+        Generates an LLM response with an explicit provider override.
+
+        Args:
+            prompt (str): text-generation prompt
+            model_name (str | None): optional model override
+            provider (str | None): provider override
+
+        Returns:
+            response (str): generated text
+        """
+        result = generate_text_result(prompt, model_name=model_name, provider=provider)
+        self._record_text_generation_cost(
+            provider=result.get("provider", provider or get_llm_provider()),
             model=result.get("model", model_name or get_configured_llm_model()),
             usage=result.get("usage", {}),
         )
@@ -1121,6 +1148,134 @@ class YouTube:
         )
         self._write_workspace_state()
 
+    def _normalize_scene_editor_data(
+        self,
+        scene_units: list[str] | None,
+        image_prompts: list[str] | None,
+    ) -> tuple[list[str], list[str]]:
+        """
+        Aligns manual scene text and prompt edits into two non-empty lists.
+
+        Args:
+            scene_units (list[str] | None): edited scene transcript chunks
+            image_prompts (list[str] | None): edited scene visual prompts
+
+        Returns:
+            aligned (tuple[list[str], list[str]]): normalized scene texts/prompts
+        """
+        normalized_units = [
+            re.sub(r"\s+", " ", str(unit or "")).strip()
+            for unit in list(scene_units or [])
+            if str(unit or "").strip()
+        ]
+        normalized_prompts = [
+            self._make_provider_friendly_image_prompt(str(prompt or ""))
+            for prompt in list(image_prompts or [])
+            if str(prompt or "").strip()
+        ]
+
+        if not normalized_units and normalized_prompts:
+            normalized_units = [prompt for prompt in normalized_prompts]
+        if not normalized_prompts and normalized_units:
+            normalized_prompts = [
+                self._make_provider_friendly_image_prompt(unit)
+                for unit in normalized_units
+            ]
+
+        if not normalized_units:
+            return [], []
+
+        target_count = max(len(normalized_units), len(normalized_prompts))
+        if len(normalized_units) < target_count:
+            normalized_units.extend(normalized_units[-1:] * (target_count - len(normalized_units)))
+        if len(normalized_prompts) < target_count:
+            fallback_prompt = normalized_prompts[-1] if normalized_prompts else self._make_provider_friendly_image_prompt(normalized_units[-1])
+            normalized_prompts.extend([fallback_prompt] * (target_count - len(normalized_prompts)))
+
+        return normalized_units[:target_count], normalized_prompts[:target_count]
+
+    def set_manual_metadata(self, metadata: dict | None) -> None:
+        """
+        Uses caller-provided metadata instead of regenerating it.
+
+        Args:
+            metadata (dict | None): title/description/tags payload
+
+        Returns:
+            None
+        """
+        cleaned_metadata = dict(metadata or {})
+        self.metadata = cleaned_metadata
+        self._manual_metadata_locked = bool(cleaned_metadata)
+
+    def set_manual_scene_data(
+        self,
+        scene_units: list[str] | None,
+        image_prompts: list[str] | None,
+    ) -> None:
+        """
+        Uses caller-provided scene transcript chunks and prompts.
+
+        Args:
+            scene_units (list[str] | None): ordered scene transcript chunks
+            image_prompts (list[str] | None): ordered visual prompts
+
+        Returns:
+            None
+        """
+        normalized_units, normalized_prompts = self._normalize_scene_editor_data(
+            scene_units,
+            image_prompts,
+        )
+        self.scene_units = normalized_units
+        self.image_prompts = normalized_prompts
+        self._manual_scene_data_locked = bool(normalized_units and normalized_prompts)
+
+    def apply_workspace_edits(
+        self,
+        workspace_dir: str | None = None,
+        *,
+        subject: str | None = None,
+        script: str | None = None,
+        metadata: dict | None = None,
+        scene_units: list[str] | None = None,
+        image_prompts: list[str] | None = None,
+    ) -> dict:
+        """
+        Persists editor changes into the saved workspace state.
+
+        Args:
+            workspace_dir (str | None): optional workspace path override
+            subject (str | None): updated subject
+            script (str | None): updated full script
+            metadata (dict | None): updated metadata
+            scene_units (list[str] | None): updated scene transcript chunks
+            image_prompts (list[str] | None): updated prompts
+
+        Returns:
+            payload (dict): saved workspace payload
+        """
+        if workspace_dir:
+            self.load_workspace_state(workspace_dir)
+
+        if subject is not None:
+            self.subject = str(subject or "").strip()
+        if script is not None:
+            self.script = str(script or "").strip()
+        if metadata is not None:
+            self.metadata = dict(metadata or {})
+        if scene_units is not None or image_prompts is not None:
+            current_scene_units = scene_units if scene_units is not None else list(getattr(self, "scene_units", []) or [])
+            current_prompts = image_prompts if image_prompts is not None else list(getattr(self, "image_prompts", []) or [])
+            normalized_units, normalized_prompts = self._normalize_scene_editor_data(
+                current_scene_units,
+                current_prompts,
+            )
+            self.scene_units = normalized_units
+            self.image_prompts = normalized_prompts
+
+        return self._write_workspace_state()
+
     def generate_metadata(self) -> dict:
         """
         Generates SEO metadata for the to-be-uploaded YouTube Short.
@@ -1814,18 +1969,223 @@ class YouTube:
         Returns:
             query (str): short search query
         """
-        preferred = re.sub(
-            r"(?i)vertical cinematic still image|photorealistic lighting|no readable text|no letters|no logos|no watermark",
-            "",
-            str(prompt_text or ""),
-        )
+        preferred = self._strip_pixabay_query_boilerplate(str(prompt_text or ""))
         preferred = re.sub(r"[^A-Za-z0-9\s]", " ", preferred)
         preferred = " ".join(preferred.split()[:6]).strip()
         if preferred:
             return preferred
 
-        fallback = re.sub(r"\s+", " ", str(scene_text or "").strip())
+        fallback = re.sub(r"\s+", " ", self._strip_pixabay_query_boilerplate(str(scene_text or "")).strip())
         return fallback[:80].strip()
+
+    def _strip_pixabay_query_boilerplate(self, value: str) -> str:
+        """
+        Removes prompt-style boilerplate that is useful for image models but
+        harmful for stock-media search queries.
+
+        Args:
+            value (str): raw prompt or scene text
+
+        Returns:
+            cleaned (str): stock-search friendly text
+        """
+        cleaned = str(value or "")
+        patterns = [
+            r"(?i)vertical cinematic still image",
+            r"(?i)photorealistic lighting",
+            r"(?i)no readable text",
+            r"(?i)no letters",
+            r"(?i)no logos?",
+            r"(?i)no watermark",
+            r"(?i)cinematic",
+            r"(?i)photorealistic",
+            r"(?i)vertical",
+            r"(?i)still image",
+            r"(?i)egyptian setting",
+            r"(?i)egyptian people",
+            r"(?i)cairo or egyptian urban life",
+            r"(?i)arabic-speaking environment",
+            r"(?i)culturally authentic details",
+        ]
+        for pattern in patterns:
+            cleaned = re.sub(pattern, " ", cleaned)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip(" ,")
+        return cleaned
+
+    def _format_pixabay_q_value(self, terms: list[str], max_chars: int = 100) -> str:
+        """
+        Builds a compact Pixabay q string using + separators.
+
+        Args:
+            terms (list[str]): ordered visual search terms
+            max_chars (int): maximum q length
+
+        Returns:
+            q (str): Pixabay q string
+        """
+        ordered_terms: list[str] = []
+        seen = set()
+        for raw_term in list(terms or []):
+            cleaned_term = self._clean_stock_search_query(raw_term, max_words=3)
+            if not cleaned_term:
+                continue
+            normalized = cleaned_term.lower()
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            ordered_terms.append(cleaned_term.title())
+
+        if not ordered_terms:
+            return ""
+
+        q_parts: list[str] = []
+        current_length = 0
+        for term in ordered_terms:
+            candidate_part = term.replace(" ", " ")
+            separator_length = 1 if q_parts else 0
+            next_length = current_length + separator_length + len(candidate_part)
+            if next_length > max_chars:
+                break
+            q_parts.append(candidate_part)
+            current_length = next_length
+
+        return "+".join(q_parts)
+
+    def _generate_pixabay_search_queries(
+        self,
+        scene_units: list[str],
+        prompt_texts: list[str],
+    ) -> dict[int, dict]:
+        """
+        Uses the configured Ollama model to generate short Pixabay-ready q
+        strings for all scenes in one batch, with heuristic fallback data when
+        the model is unavailable.
+
+        Args:
+            scene_units (list[str]): ordered scene transcript chunks
+            prompt_texts (list[str]): ordered prompt texts
+
+        Returns:
+            queries_by_scene (dict[int, dict]): primary/fallback q strings
+        """
+        fallback_queries: dict[int, dict] = {}
+        cleaned_scene_payload = []
+        for index, scene_text in enumerate(scene_units):
+            cleaned_prompt = self._strip_pixabay_query_boilerplate(
+                prompt_texts[index] if index < len(prompt_texts) else ""
+            )
+            cleaned_scene = self._strip_pixabay_query_boilerplate(scene_text)
+            heuristic_primary = self._format_pixabay_q_value(
+                [
+                    self._derive_stock_query_from_scene(cleaned_scene, cleaned_prompt),
+                    cleaned_scene,
+                ]
+            )
+            heuristic_fallback = self._format_pixabay_q_value(
+                [
+                    cleaned_prompt,
+                    cleaned_scene,
+                    self.subject,
+                ]
+            )
+            fallback_queries[index] = {
+                "primary_q": heuristic_primary,
+                "fallback_q": heuristic_fallback if heuristic_fallback != heuristic_primary else "",
+                "source": "heuristic",
+                "query_generation_note": "",
+            }
+            cleaned_scene_payload.append(
+                {
+                    "scene_index": index,
+                    "scene_text": cleaned_scene,
+                    "prompt_text": cleaned_prompt,
+                }
+            )
+
+        if not cleaned_scene_payload:
+            return fallback_queries
+
+        ollama_model = str(get_ollama_model() or "").strip()
+        if not ollama_model:
+            return fallback_queries
+
+        last_error = ""
+        for attempt in range(2):
+            try:
+                completion = (
+                    str(
+                        self.generate_response_with_provider(
+                            (
+                                "Return only valid JSON.\n"
+                                "For each scene, create Pixabay search q values that are visually literal and compact.\n"
+                                "Rules:\n"
+                                "- English only.\n"
+                                "- Return an array with one object per scene.\n"
+                                "- Each object must include: scene_index, primary_q, fallback_q.\n"
+                                "- primary_q and fallback_q must be Pixabay q strings using + separators.\n"
+                                "- Each q must stay under 100 characters.\n"
+                                "- Prefer concrete people, place, object, clothing, and action terms.\n"
+                                "- Never include cinematic/style prompt words like vertical, photorealistic, watermark, logo, text.\n"
+                                "- Never repeat locale boilerplate like Egyptian setting or Arabic-speaking environment unless essential.\n"
+                                "- Keep queries stock-search friendly, not descriptive sentences.\n"
+                                f"Video subject: {self._strip_pixabay_query_boilerplate(self.subject)}\n"
+                                f"Scenes JSON: {json.dumps(cleaned_scene_payload, ensure_ascii=False)}"
+                            ),
+                            model_name=ollama_model,
+                            provider="ollama",
+                        )
+                    )
+                    .replace("```json", "")
+                    .replace("```", "")
+                    .strip()
+                )
+                parsed = json.loads(completion)
+                applied_queries = 0
+                if isinstance(parsed, list):
+                    for item in parsed:
+                        if not isinstance(item, dict):
+                            continue
+                        scene_index = int(item.get("scene_index", -1) or -1)
+                        if scene_index not in fallback_queries:
+                            continue
+                        primary_q = self._format_pixabay_q_value(
+                            re.split(r"\s*\+\s*", str(item.get("primary_q", "") or "").strip())
+                        )
+                        fallback_q = self._format_pixabay_q_value(
+                            re.split(r"\s*\+\s*", str(item.get("fallback_q", "") or "").strip())
+                        )
+                        if primary_q:
+                            fallback_queries[scene_index]["primary_q"] = primary_q
+                            fallback_queries[scene_index]["source"] = "ollama"
+                            fallback_queries[scene_index]["query_generation_note"] = (
+                                "Generated via Ollama stock-query planner."
+                            )
+                            applied_queries += 1
+                        if fallback_q and fallback_q != primary_q:
+                            fallback_queries[scene_index]["fallback_q"] = fallback_q
+
+                if applied_queries > 0:
+                    return fallback_queries
+
+                last_error = "Ollama returned no usable Pixabay q values."
+            except Exception as exc:
+                last_error = str(exc).strip() or "Unknown Ollama query-generation error."
+
+            if attempt == 0:
+                time.sleep(0.4)
+
+        note = (
+            "Fell back to heuristic Pixabay q values after Ollama query generation failed twice."
+            if last_error
+            else "Fell back to heuristic Pixabay q values."
+        )
+        for payload in fallback_queries.values():
+            payload["query_generation_note"] = note
+
+        if last_error and get_verbose():
+            warning(f"Pixabay q generation fell back to heuristics: {last_error}")
+
+        return fallback_queries
 
     def _clean_stock_search_query(self, value: str, max_words: int = 6) -> str:
         """
@@ -1841,7 +2201,9 @@ class YouTube:
         cleaned = str(value or "")
         cleaned = re.sub(
             r"(?i)vertical cinematic still image|photorealistic lighting|no readable text|no letters|"
-            r"no logos|no watermark|cinematic|photorealistic|vertical|still image|image prompt",
+            r"no logos|no watermark|cinematic|photorealistic|vertical|still image|image prompt|"
+            r"egyptian setting|egyptian people|cairo or egyptian urban life|arabic speaking environment|"
+            r"arabic-speaking environment|culturally authentic details",
             " ",
             cleaned,
         )
@@ -2113,6 +2475,7 @@ class YouTube:
             intents_and_context (tuple[list[dict], dict]): normalized scene intents and global context
         """
         global_context = self._get_stock_global_context()
+        ai_pixabay_queries = self._generate_pixabay_search_queries(scene_units, prompt_texts)
         fallback_intents = [
             self._build_fallback_scene_stock_intent(
                 scene_index=index,
@@ -2122,6 +2485,42 @@ class YouTube:
             )
             for index in range(len(scene_units))
         ]
+        for index, intent in enumerate(fallback_intents):
+            generated_queries = ai_pixabay_queries.get(index, {})
+            if not generated_queries:
+                continue
+            query_variants = []
+            primary_q = str(generated_queries.get("primary_q", "") or "").strip()
+            fallback_q = str(generated_queries.get("fallback_q", "") or "").strip()
+            if primary_q:
+                query_variants.append({"type": "ai_primary_q", "query": primary_q})
+            if fallback_q and fallback_q != primary_q:
+                query_variants.append({"type": "ai_fallback_q", "query": fallback_q})
+            existing_queries = {
+                str(variant.get("query", "")).strip()
+                for variant in intent.get("query_variants", [])
+                if isinstance(variant, dict)
+            }
+            for variant in intent.get("query_variants", []):
+                if isinstance(variant, dict):
+                    query_variants.append(variant)
+            intent["query_variants"] = []
+            seen_queries = set()
+            for variant in query_variants:
+                cleaned_query = self._format_pixabay_q_value(
+                    re.split(r"\s*\+\s*", str(variant.get("query", "") or "").strip())
+                )
+                if not cleaned_query or cleaned_query in seen_queries:
+                    continue
+                seen_queries.add(cleaned_query)
+                intent["query_variants"].append(
+                    {
+                        "type": str(variant.get("type", "variant") or "variant"),
+                        "query": cleaned_query,
+                        }
+                    )
+            intent["pixabay_query_source"] = generated_queries.get("source", "heuristic")
+            intent["query_generation_note"] = generated_queries.get("query_generation_note", "")
 
         if not scene_units:
             return fallback_intents, global_context
@@ -2174,6 +2573,38 @@ class YouTube:
                     )
                     for index in range(len(scene_units))
                 ]
+                for index, intent in enumerate(intents):
+                    generated_queries = ai_pixabay_queries.get(index, {})
+                    if not generated_queries:
+                        continue
+                    primary_q = str(generated_queries.get("primary_q", "") or "").strip()
+                    fallback_q = str(generated_queries.get("fallback_q", "") or "").strip()
+                    merged_variants = []
+                    if primary_q:
+                        merged_variants.append({"type": "ai_primary_q", "query": primary_q})
+                    if fallback_q and fallback_q != primary_q:
+                        merged_variants.append({"type": "ai_fallback_q", "query": fallback_q})
+                    merged_variants.extend(intent.get("query_variants", []))
+                    deduped_variants = []
+                    seen_queries = set()
+                    for variant in merged_variants:
+                        if not isinstance(variant, dict):
+                            continue
+                        cleaned_query = self._format_pixabay_q_value(
+                            re.split(r"\s*\+\s*", str(variant.get("query", "") or "").strip())
+                        )
+                        if not cleaned_query or cleaned_query in seen_queries:
+                            continue
+                        seen_queries.add(cleaned_query)
+                        deduped_variants.append(
+                            {
+                                "type": str(variant.get("type", "variant") or "variant"),
+                                "query": cleaned_query,
+                            }
+                        )
+                    intent["query_variants"] = deduped_variants
+                    intent["pixabay_query_source"] = generated_queries.get("source", "heuristic")
+                    intent["query_generation_note"] = generated_queries.get("query_generation_note", "")
                 return intents, global_context
         except Exception:
             pass
@@ -2222,6 +2653,8 @@ class YouTube:
             bonus (float): additive score bonus
         """
         priorities = {
+            "ai_primary_q": 9.5,
+            "ai_fallback_q": 8.5,
             "literal_scene": 8.0,
             "subject_action": 7.0,
             "subject_setting": 6.0,
@@ -2503,6 +2936,7 @@ class YouTube:
         self,
         scene_intent: dict,
         preferred_duration: float | None = None,
+        max_query_variants: int = 3,
     ) -> list[dict]:
         """
         Searches Pixabay using all query variants for one scene, merges the
@@ -2511,20 +2945,24 @@ class YouTube:
         Args:
             scene_intent (dict): normalized scene intent
             preferred_duration (float | None): scene duration target
+            max_query_variants (int): maximum search variants to try
 
         Returns:
             candidates (list[dict]): ranked merged candidate pool
         """
         candidates_by_key: dict[str, dict] = {}
         per_page = max(4, get_pixabay_results_per_query())
+        query_variants = list(scene_intent.get("query_variants", []) or [])
+        if max_query_variants and len(query_variants) > max_query_variants:
+            query_variants = query_variants[:max_query_variants]
 
-        for query_variant in scene_intent.get("query_variants", []):
+        for variant_index, query_variant in enumerate(query_variants):
             query = str(query_variant.get("query", "")).strip()
             if not query:
                 continue
 
             params = {
-                "q": query,
+                "q": query.replace("+", " "),
                 "safesearch": "true",
                 "per_page": per_page,
             }
@@ -2604,6 +3042,28 @@ class YouTube:
             except Exception as exc:
                 if get_verbose():
                     warning(f'Pixabay image lookup failed for "{query}": {exc}')
+
+            ranked_candidates = sorted(
+                candidates_by_key.values(),
+                key=lambda item: (
+                    float(item.get("base_score", 0.0)),
+                    len(item.get("matched_queries", [])),
+                    int(item.get("views", 0)),
+                    int(item.get("likes", 0)),
+                ),
+                reverse=True,
+            )
+            if ranked_candidates:
+                best_score = float(self._get_pixabay_selection_score(ranked_candidates[0]))
+                strong_candidate_count = len(
+                    [
+                        candidate
+                        for candidate in ranked_candidates[:3]
+                        if self._pixabay_candidate_meets_quality_threshold(candidate)
+                    ]
+                )
+                if best_score >= 78.0 or (variant_index == 0 and strong_candidate_count >= 2):
+                    break
 
         return sorted(
             candidates_by_key.values(),
@@ -2776,6 +3236,7 @@ class YouTube:
         scene_units: list[str],
         prompt_texts: list[str],
         preferred_scene_durations: list[float],
+        scene_indices: list[int] | None = None,
     ) -> dict[int, dict]:
         """
         Plans, selects, downloads, and tracks the best Pixabay assets for all
@@ -2785,26 +3246,38 @@ class YouTube:
             scene_units (list[str]): ordered scene texts
             prompt_texts (list[str]): aligned image prompts
             preferred_scene_durations (list[float]): estimated scene durations
+            scene_indices (list[int] | None): optional original scene indices
 
         Returns:
             assets_by_scene (dict[int, dict]): downloaded asset descriptors by scene
         """
         assets_by_scene: dict[int, dict] = {}
+        actual_scene_indices = (
+            [int(index) for index in scene_indices]
+            if scene_indices is not None
+            else list(range(len(scene_units)))
+        )
+
+        if len(actual_scene_indices) != len(scene_units):
+            raise ValueError("scene_indices must align with scene_units.")
+
         scene_intents, global_context = self._build_scene_stock_intents(scene_units, prompt_texts)
         scene_plans = []
 
-        for scene_index, scene_text in enumerate(scene_units):
-            prompt_text = prompt_texts[scene_index] if scene_index < len(prompt_texts) else ""
-            scene_intent = scene_intents[scene_index] if scene_index < len(scene_intents) else self._build_fallback_scene_stock_intent(
+        for local_scene_index, scene_text in enumerate(scene_units):
+            scene_index = actual_scene_indices[local_scene_index]
+            prompt_text = prompt_texts[local_scene_index] if local_scene_index < len(prompt_texts) else ""
+            scene_intent = scene_intents[local_scene_index] if local_scene_index < len(scene_intents) else self._build_fallback_scene_stock_intent(
                 scene_index,
                 scene_text,
                 prompt_text,
                 global_context,
             )
-            preferred_duration = preferred_scene_durations[min(scene_index, len(preferred_scene_durations) - 1)] if preferred_scene_durations else None
+            preferred_duration = preferred_scene_durations[local_scene_index] if local_scene_index < len(preferred_scene_durations) else None
             candidates = self._collect_pixabay_scene_candidates(scene_intent, preferred_duration=preferred_duration)
             scene_plans.append(
                 {
+                    "local_scene_index": local_scene_index,
                     "scene_index": scene_index,
                     "scene_text": scene_text,
                     "prompt_text": prompt_text,
@@ -2819,7 +3292,8 @@ class YouTube:
 
         for plan in scene_plans:
             scene_index = plan["scene_index"]
-            selected_candidate = selected_by_scene.get(scene_index)
+            local_scene_index = plan["local_scene_index"]
+            selected_candidate = selected_by_scene.get(local_scene_index)
             approved_candidate = selected_candidate if self._pixabay_candidate_meets_quality_threshold(selected_candidate) else None
             selected_summary = None
             local_asset_path = None
@@ -2899,6 +3373,7 @@ class YouTube:
                         "mood": plan["scene_intent"].get("mood", ""),
                         "must_show": plan["scene_intent"].get("must_show", []),
                         "must_avoid": plan["scene_intent"].get("must_avoid", []),
+                        "pixabay_query_source": plan["scene_intent"].get("pixabay_query_source", "heuristic"),
                     },
                     "query_variants": plan["scene_intent"].get("query_variants", []),
                     "candidate_count": len(plan.get("candidates", [])),
@@ -2920,6 +3395,32 @@ class YouTube:
             }
         )
         return assets_by_scene
+
+    def _get_existing_visual_asset_scene_indices(self, target_count: int) -> set[int]:
+        """
+        Returns the set of scene indices that already have a tracked visual asset.
+
+        Args:
+            target_count (int): maximum valid scene count
+
+        Returns:
+            scene_indices (set[int]): completed scene indices
+        """
+        scene_indices: set[int] = set()
+
+        for asset in list(getattr(self, "visual_assets", []) or []):
+            if not isinstance(asset, dict):
+                continue
+            scene_index = asset.get("scene_index")
+            try:
+                normalized_index = int(scene_index)
+            except (TypeError, ValueError):
+                continue
+
+            if 0 <= normalized_index < int(target_count):
+                scene_indices.add(normalized_index)
+
+        return scene_indices
 
     def _estimate_scene_durations_for_asset_search(self) -> list[float]:
         """
@@ -3151,6 +3652,59 @@ class YouTube:
                     except ImageRateLimitError:
                         raise
 
+        for retry_round in range(1, VISUAL_ASSET_RETRY_ROUNDS + 1):
+            existing_scene_indices = self._get_existing_visual_asset_scene_indices(target_count)
+            missing_scene_indices = [
+                scene_index for scene_index in range(target_count)
+                if scene_index not in existing_scene_indices
+            ]
+            if not missing_scene_indices:
+                break
+
+            warning(
+                f"Generated {len(existing_scene_indices)}/{target_count} visual assets. "
+                f"Retrying {len(missing_scene_indices)} missing scene(s) "
+                f"({retry_round}/{VISUAL_ASSET_RETRY_ROUNDS})."
+            )
+
+            if strategy in ("mixed", "pixabay_only"):
+                retry_scene_units = [scene_units[scene_index] for scene_index in missing_scene_indices]
+                retry_prompt_texts = [
+                    self.image_prompts[scene_index] if scene_index < len(self.image_prompts) else self.image_prompts[-1]
+                    for scene_index in missing_scene_indices
+                ]
+                retry_durations = [
+                    estimated_scene_durations[scene_index] if scene_index < len(estimated_scene_durations) else None
+                    for scene_index in missing_scene_indices
+                ]
+                pixabay_assets_by_scene.update(
+                    self._plan_pixabay_scene_assets(
+                        retry_scene_units,
+                        retry_prompt_texts,
+                        retry_durations,
+                        scene_indices=missing_scene_indices,
+                    )
+                )
+
+            previous_count = len(self._get_existing_visual_asset_scene_indices(target_count))
+
+            for scene_index in missing_scene_indices:
+                if scene_index in self._get_existing_visual_asset_scene_indices(target_count):
+                    continue
+
+                if strategy in ("mixed", "ai_only") and ai_used < max_ai_assets:
+                    prompt = self.image_prompts[scene_index] if scene_index < len(self.image_prompts) else self.image_prompts[-1]
+                    try:
+                        asset_created = bool(self.generate_image(prompt, scene_index=scene_index))
+                        if asset_created:
+                            ai_used += 1
+                    except ImageRateLimitError:
+                        raise
+
+            current_count = len(self._get_existing_visual_asset_scene_indices(target_count))
+            if current_count <= previous_count:
+                break
+
         return len(self.visual_assets)
 
     def _get_video_trim_window(self, clip_duration: float, target_duration: float, scene_index: int) -> tuple[float, float]:
@@ -3290,37 +3844,60 @@ class YouTube:
             else:
                 clip = clip.fx(vfx.loop, duration=duration)
             clip = clip.set_fps(get_video_fps())
-        else:
-            clip = ImageClip(asset_path)
-            clip = clip.set_duration(duration).set_fps(get_video_fps())
 
-        if round((clip.w / clip.h), 4) < 0.5625:
-            if get_verbose():
-                info(f' => Resizing Asset: {working_asset_path if asset_type == "video" else asset_path} to 1080x1920')
-            clip = crop(
-                clip,
-                width=clip.w,
-                height=round(clip.w / 0.5625),
-                x_center=clip.w / 2,
-                y_center=clip.h / 2,
-            )
-        else:
-            if get_verbose():
-                info(f' => Resizing Asset: {working_asset_path if asset_type == "video" else asset_path} to 1920x1080')
-            clip = crop(
-                clip,
-                width=round(0.5625 * clip.h),
-                height=clip.h,
-                x_center=clip.w / 2,
-                y_center=clip.h / 2,
-            )
-
-        clip = clip.resize((1080, 1920))
-
-        if asset_type == "video":
+            # Crop and resize video to 1080x1920
+            if round((clip.w / clip.h), 4) < 0.5625:
+                if get_verbose():
+                    info(f' => Resizing Asset: {working_asset_path} to 1080x1920')
+                clip = crop(
+                    clip,
+                    width=clip.w,
+                    height=round(clip.w / 0.5625),
+                    x_center=clip.w / 2,
+                    y_center=clip.h / 2,
+                )
+            else:
+                if get_verbose():
+                    info(f' => Resizing Asset: {working_asset_path} to 1920x1080')
+                clip = crop(
+                    clip,
+                    width=round(0.5625 * clip.h),
+                    height=clip.h,
+                    x_center=clip.w / 2,
+                    y_center=clip.h / 2,
+                )
+            clip = clip.resize((1080, 1920))
             clip = self._stabilize_video_scene_clip(clip, duration)
         else:
-            clip = self._apply_image_motion(clip, duration, scene_index)
+            # For images, use FFmpeg-based Ken Burns (10-20x faster than MoviePy)
+            try:
+                kenburns_video_path = self._apply_image_motion_ffmpeg(asset_path, duration, scene_index)
+                clip = VideoFileClip(kenburns_video_path).without_audio()
+                clip = clip.set_fps(get_video_fps())
+            except Exception as e:
+                # Fallback to slow MoviePy method if FFmpeg fails
+                warning(f"FFmpeg Ken Burns failed, using fallback: {e}")
+                clip = ImageClip(asset_path)
+                clip = clip.set_duration(duration).set_fps(get_video_fps())
+
+                if round((clip.w / clip.h), 4) < 0.5625:
+                    clip = crop(
+                        clip,
+                        width=clip.w,
+                        height=round(clip.w / 0.5625),
+                        x_center=clip.w / 2,
+                        y_center=clip.h / 2,
+                    )
+                else:
+                    clip = crop(
+                        clip,
+                        width=round(0.5625 * clip.h),
+                        height=clip.h,
+                        x_center=clip.w / 2,
+                        y_center=clip.h / 2,
+                    )
+                clip = clip.resize((1080, 1920))
+                clip = self._apply_image_motion(clip, duration, scene_index)
 
         return clip
 
@@ -3351,6 +3928,9 @@ class YouTube:
         """
         Applies a subtle Ken Burns-style move to still images so they feel
         more like living scenes than static slides.
+
+        NOTE: This method is deprecated in favor of _apply_image_motion_ffmpeg
+        which is 10-20x faster. Kept for fallback compatibility.
 
         Args:
             clip: base MoviePy image clip already normalized to 1080x1920
@@ -3401,6 +3981,110 @@ class YouTube:
         )
 
         return CompositeVideoClip([animated], size=(canvas_w, canvas_h)).set_duration(duration).set_fps(get_video_fps())
+
+    def _apply_image_motion_ffmpeg(self, image_path: str, duration: float, scene_index: int) -> str:
+        """
+        Applies Ken Burns effect using FFmpeg's native zoompan filter.
+        This is 10-20x faster than the MoviePy per-frame approach.
+
+        Args:
+            image_path (str): path to the source image
+            duration (float): scene duration in seconds
+            scene_index (int): scene order for pattern selection
+
+        Returns:
+            video_path (str): path to the rendered video clip with Ken Burns effect
+        """
+        duration = max(0.35, float(duration or 0.35))
+        fps = get_video_fps()
+        total_frames = max(1, int(duration * fps))
+        canvas_w, canvas_h = 1080, 1920
+
+        motion_patterns = [
+            {"zoom_start": 1.08, "zoom_end": 1.16, "x_start": 0.00, "x_end": -70.0, "y_start": -10.0, "y_end": 20.0},
+            {"zoom_start": 1.15, "zoom_end": 1.05, "x_start": -60.0, "x_end": 20.0, "y_start": -25.0, "y_end": 10.0},
+            {"zoom_start": 1.10, "zoom_end": 1.18, "x_start": 25.0, "x_end": -25.0, "y_start": -40.0, "y_end": 40.0},
+            {"zoom_start": 1.14, "zoom_end": 1.08, "x_start": -20.0, "x_end": 35.0, "y_start": 15.0, "y_end": -35.0},
+            {"zoom_start": 1.07, "zoom_end": 1.14, "x_start": 0.0, "x_end": 0.0, "y_start": -60.0, "y_end": 35.0},
+            {"zoom_start": 1.12, "zoom_end": 1.06, "x_start": -35.0, "x_end": 45.0, "y_start": 0.0, "y_end": 0.0},
+        ]
+        pattern = motion_patterns[scene_index % len(motion_patterns)]
+
+        z_start = pattern["zoom_start"]
+        z_end = pattern["zoom_end"]
+        x_start = pattern["x_start"]
+        x_end = pattern["x_end"]
+        y_start = pattern["y_start"]
+        y_end = pattern["y_end"]
+
+        # Clamp pan values to safe bounds based on max zoom
+        max_zoom = max(z_start, z_end)
+        max_x_drift = max(0.0, ((canvas_w * max_zoom) - canvas_w) / 2)
+        max_y_drift = max(0.0, ((canvas_h * max_zoom) - canvas_h) / 2)
+        x_start = max(-max_x_drift, min(max_x_drift, x_start))
+        x_end = max(-max_x_drift, min(max_x_drift, x_end))
+        y_start = max(-max_y_drift, min(max_y_drift, y_start))
+        y_end = max(-max_y_drift, min(max_y_drift, y_end))
+
+        # Build FFmpeg zoompan filter expressions
+        # Zoom: linear interpolation from z_start to z_end over total_frames
+        z_expr = f"{z_start}+(({z_end}-{z_start})*on/{total_frames})"
+
+        # Pan X: center position with offset, lerping from x_start to x_end
+        # FFmpeg zoompan x = (zoomed_width - output_width) / 2 - pan_offset
+        x_pan_expr = f"({x_start}+(({x_end}-{x_start})*on/{total_frames}))"
+        x_expr = f"(iw*({z_expr})-{canvas_w})/2-({x_pan_expr})"
+
+        # Pan Y: same logic for vertical
+        y_pan_expr = f"({y_start}+(({y_end}-{y_start})*on/{total_frames}))"
+        y_expr = f"(ih*({z_expr})-{canvas_h})/2-({y_pan_expr})"
+
+        output_path = self._get_workspace_path(f"scene_{scene_index}_kenburns.mp4")
+
+        # Skip if already rendered (e.g. reused asset from scene alignment)
+        if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+            return output_path
+
+        # Build the filter chain:
+        # 1. Scale image to 1080x1920 (crop to fit aspect ratio first)
+        # 2. Apply zoompan for Ken Burns effect
+        scale_filter = f"scale={canvas_w}:{canvas_h}:force_original_aspect_ratio=increase,crop={canvas_w}:{canvas_h}"
+        zoompan_filter = f"zoompan=z='{z_expr}':x='{x_expr}':y='{y_expr}':d={total_frames}:s={canvas_w}x{canvas_h}:fps={fps}"
+
+        # Always use libx264 for intermediate Ken Burns clips to avoid
+        # exhausting NVENC GPU encoder sessions. NVENC is reserved for the
+        # final video export only.
+        encoder = "libx264"
+        encoder_params = ["-preset", "veryfast"]
+
+        cmd = [
+            "ffmpeg", "-y",
+            "-loop", "1",
+            "-i", image_path,
+            "-vf", f"{scale_filter},{zoompan_filter}",
+            "-t", str(duration),
+            "-c:v", encoder,
+            *encoder_params,
+            "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart",
+            output_path,
+        ]
+
+        if get_verbose():
+            info(f" => Rendering Ken Burns for scene {scene_index} via FFmpeg ({encoder})...")
+
+        try:
+            result = subprocess.run(
+                cmd,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        except subprocess.CalledProcessError as e:
+            warning(f"FFmpeg Ken Burns failed for scene {scene_index}: {e.stderr}")
+            raise
+
+        return output_path
 
     def _get_scene_durations(self, total_duration: float) -> list[float]:
         """
@@ -3568,6 +4252,51 @@ class YouTube:
             last_asset = asset
 
         return ordered_assets
+
+    def _sync_images_from_visual_assets(self) -> None:
+        """
+        Keeps the legacy image list aligned with the current visual asset list.
+
+        Returns:
+            None
+        """
+        self.images = [
+            asset.get("path")
+            for asset in list(getattr(self, "visual_assets", []) or [])
+            if isinstance(asset, dict)
+            and str(asset.get("type", "")).strip().lower() == "image"
+            and str(asset.get("path", "")).strip()
+        ]
+
+    def _replace_scene_asset_record(self, scene_index: int, asset_record: dict) -> dict:
+        """
+        Replaces the tracked asset for one scene and keeps asset caches aligned.
+
+        Args:
+            scene_index (int): scene order to replace
+            asset_record (dict): new tracked asset payload
+
+        Returns:
+            asset_record (dict): normalized stored asset payload
+        """
+        normalized_record = dict(asset_record or {})
+        normalized_record["scene_index"] = int(scene_index)
+
+        retained_assets = [
+            asset
+            for asset in list(getattr(self, "visual_assets", []) or [])
+            if not (
+                isinstance(asset, dict)
+                and int(asset.get("scene_index", -9999) or -9999) == int(scene_index)
+            )
+        ]
+
+        insert_index = min(max(int(scene_index), 0), len(retained_assets))
+        retained_assets.insert(insert_index, normalized_record)
+        self.visual_assets = retained_assets
+        self._sync_images_from_visual_assets()
+        self._write_workspace_state()
+        return normalized_record
 
     def _parse_srt_entries_utf8(self, srt_path: str) -> list[tuple[tuple[float, float], str]]:
         """
@@ -4196,7 +4925,9 @@ class YouTube:
     def _transcribe_with_whisper(self, audio_path: str, *, word_timestamps: bool = False):
         """
         Runs faster-whisper with a CPU fallback when the configured backend is
-        unavailable or broken.
+        unavailable or broken.  Results are cached on the instance so that
+        multiple callers (scene alignment, subtitles, SFX) share a single
+        transcription pass.
 
         Args:
             audio_path (str): audio file path
@@ -4205,12 +4936,20 @@ class YouTube:
         Returns:
             result (tuple[list, object, str, str]): segments, info, device, compute type
         """
+        # Return cached result when available and sufficient
+        cache = getattr(self, "_whisper_cache", None)
+        if cache is not None:
+            cached_path, cached_wt, cached_result = cache
+            if cached_path == os.path.abspath(audio_path) and (cached_wt or not word_timestamps):
+                return cached_result
+
         from faster_whisper import WhisperModel
 
         requested_device = get_whisper_device()
         requested_compute_type = get_whisper_compute_type()
+        # Always request word_timestamps so the cache satisfies all callers
         transcribe_kwargs = self._get_whisper_transcribe_kwargs(
-            word_timestamps=word_timestamps
+            word_timestamps=True,
         )
 
         def attempt(device: str, compute_type: str):
@@ -4224,7 +4963,7 @@ class YouTube:
 
         try:
             segments, info = attempt(requested_device, requested_compute_type)
-            return segments, info, requested_device, requested_compute_type
+            result = (segments, info, requested_device, requested_compute_type)
         except Exception as primary_exc:
             if requested_device == "cpu" and requested_compute_type == "int8":
                 raise
@@ -4242,7 +4981,10 @@ class YouTube:
                 },
             )
             segments, info = attempt("cpu", "int8")
-            return segments, info, "cpu", "int8"
+            result = (segments, info, "cpu", "int8")
+
+        self._whisper_cache = (os.path.abspath(audio_path), True, result)
+        return result
 
     def _contains_arabic_text(self, value: str) -> bool:
         """
@@ -4254,7 +4996,44 @@ class YouTube:
         Returns:
             is_arabic (bool): True when Arabic characters are present
         """
-        return bool(re.search(r"[\u0600-\u06FF]", str(value or "")))
+        return bool(
+            re.search(
+                r"[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]",
+                str(value or ""),
+            )
+        )
+
+    def _should_use_arabic_subtitle_rendering(self, text: str) -> bool:
+        """
+        Returns whether subtitles should be rendered with the Arabic font and
+        RTL-aware renderer.
+
+        Args:
+            text (str): subtitle text
+
+        Returns:
+            should_use (bool): True when Arabic rendering should be used
+        """
+        if self._contains_arabic_text(text):
+            return True
+
+        if self._contains_arabic_text(getattr(self, "script", "")):
+            return True
+
+        normalized_language = str(getattr(self, "language", "") or "").strip().lower()
+        normalized_dialect = str(getattr(self, "dialect", "") or "").strip().lower()
+        arabic_markers = (
+            "arabic",
+            "egyptian",
+            "gulf",
+            "saudi",
+            "levantine",
+            "darija",
+            "moroccan",
+        )
+        return any(marker in normalized_language for marker in arabic_markers) or any(
+            marker in normalized_dialect for marker in arabic_markers
+        )
 
     def _get_subtitle_font_filename_for_text(self, text: str) -> str:
         """
@@ -4268,21 +5047,49 @@ class YouTube:
         """
         preferred_font = (
             get_subtitle_font_arabic()
-            if self._contains_arabic_text(text) or self._contains_arabic_text(getattr(self, "script", ""))
+            if self._should_use_arabic_subtitle_rendering(text)
             else get_subtitle_font_english()
         )
-        fonts_dir = get_fonts_dir()
-        preferred_path = os.path.join(fonts_dir, preferred_font)
-        if os.path.exists(preferred_path):
+        preferred_path = self._resolve_subtitle_font_path(preferred_font)
+        if preferred_path:
             return preferred_path
 
         fallback_font = get_subtitle_font()
-        fallback_path = os.path.join(fonts_dir, fallback_font)
-        if os.path.exists(fallback_path):
+        fallback_path = self._resolve_subtitle_font_path(fallback_font)
+        if fallback_path:
             return fallback_path
 
-        legacy_path = os.path.join(fonts_dir, get_font())
+        legacy_path = self._resolve_subtitle_font_path(get_font())
         return legacy_path
+
+    def _resolve_subtitle_font_path(self, font_name: str) -> str:
+        """
+        Resolves a subtitle font filename/path from repo fonts or common
+        system font directories.
+
+        Args:
+            font_name (str): configured font name or path
+
+        Returns:
+            path (str): resolved absolute font path or original value
+        """
+        raw_font = str(font_name or "").strip()
+        if not raw_font:
+            return ""
+        if os.path.isabs(raw_font) and os.path.exists(raw_font):
+            return os.path.abspath(raw_font)
+
+        candidate_paths = [
+            os.path.join(get_fonts_dir(), raw_font),
+        ]
+        if os.name == "nt":
+            candidate_paths.append(os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts", raw_font))
+
+        for path in candidate_paths:
+            if os.path.exists(path):
+                return os.path.abspath(path)
+
+        return raw_font
 
     def _get_explicit_arabic_subtitle_font_path(self) -> str:
         """
@@ -4292,27 +5099,25 @@ class YouTube:
         Returns:
             path (str): Arabic subtitle font path
         """
-        fonts_dir = get_fonts_dir()
         preferred_font = get_subtitle_font_arabic()
-        preferred_path = os.path.join(fonts_dir, preferred_font)
-        if os.path.exists(preferred_path):
+        preferred_path = self._resolve_subtitle_font_path(preferred_font)
+        if preferred_path and os.path.exists(preferred_path):
             return preferred_path
 
         fallback_font = get_subtitle_font()
-        fallback_path = os.path.join(fonts_dir, fallback_font)
-        if os.path.exists(fallback_path):
+        fallback_path = self._resolve_subtitle_font_path(fallback_font)
+        if fallback_path and os.path.exists(fallback_path):
             warning(
                 f"Configured Arabic subtitle font '{preferred_font}' was not found. Falling back to '{fallback_font}'."
             )
             return fallback_path
 
-        legacy_path = os.path.join(fonts_dir, get_font())
+        legacy_path = self._resolve_subtitle_font_path(get_font())
         return legacy_path
 
     def _shape_subtitle_text_for_rendering(self, text: str) -> str:
         """
-        Normalizes subtitle text before drawing. For Arabic, we keep the raw
-        text and rely on RTL-aware drawing options when available.
+        Normalizes subtitle text before drawing.
 
         Args:
             text (str): subtitle text
@@ -4322,6 +5127,52 @@ class YouTube:
         """
         raw_text = str(text or "").strip()
         return re.sub(r"\s+", " ", raw_text).strip()
+
+    def _pil_supports_rtl_layout(self) -> bool:
+        """
+        Returns whether the local Pillow build can render RTL scripts natively.
+
+        Returns:
+            supports_rtl (bool): True when libraqm-based RTL support is available
+        """
+        try:
+            return bool(pil_features.check("raqm"))
+        except Exception:
+            return False
+
+    def _shape_arabic_text_for_pil(self, text: str) -> str:
+        """
+        Shapes Arabic text into visual order for Pillow builds that do not
+        support RTL layout natively.
+
+        Args:
+            text (str): logical-order subtitle text
+
+        Returns:
+            shaped (str): visual-order Arabic text for drawing
+        """
+        return self._fallback_rtl_visual_order(text)
+
+    def _prepare_text_for_pil(self, text: str) -> tuple[str, dict]:
+        """
+        Prepares subtitle text for Pillow drawing/measurement.
+
+        Args:
+            text (str): logical-order subtitle text
+
+        Returns:
+            prepared (tuple[str, dict]): display text and optional draw kwargs
+        """
+        normalized = self._shape_subtitle_text_for_rendering(text)
+        if not normalized:
+            return "", {}
+
+        if self._should_use_arabic_subtitle_rendering(normalized):
+            if self._pil_supports_rtl_layout():
+                return normalized, {"direction": "rtl", "language": "ar"}
+            return self._fallback_rtl_visual_order(normalized), {}
+
+        return normalized, {}
 
     def _get_pil_subtitle_draw_kwargs(self, text: str) -> dict:
         """
@@ -4333,15 +5184,13 @@ class YouTube:
         Returns:
             kwargs (dict): PIL text drawing options
         """
-        if self._contains_arabic_text(text):
-            return {"direction": "rtl", "language": "ar"}
-        return {}
+        return self._prepare_text_for_pil(text)[1]
 
     def _fallback_rtl_visual_order(self, text: str) -> str:
         """
         Fallback for environments where RTL drawing support is unavailable.
-        It reverses each line so Arabic can still appear in readable order in
-        basic left-to-right renderers.
+        It reverses each line so Arabic can at least stay legible in basic
+        left-to-right renderers when no proper RTL engine is available.
 
         Args:
             text (str): subtitle text
@@ -4350,7 +5199,9 @@ class YouTube:
             reordered (str): visually reordered text
         """
         lines = str(text or "").splitlines() or [str(text or "")]
-        return "\n".join(line[::-1] for line in lines)
+        normalized_lines = [re.sub(r"\s+", " ", line).strip() for line in lines]
+        normalized_lines = [line for line in normalized_lines if line]
+        return "\n".join(line[::-1] for line in normalized_lines)
 
     def _load_subtitle_font(self, text: str):
         """
@@ -4362,7 +5213,7 @@ class YouTube:
         Returns:
             font (ImageFont.FreeTypeFont): loaded font
         """
-        font_path = self._get_explicit_arabic_subtitle_font_path()
+        font_path = self._get_subtitle_font_filename_for_text(text)
         font_size = max(24, int(get_subtitle_font_size()))
         try:
             return ImageFont.truetype(font_path, font_size)
@@ -4395,30 +5246,31 @@ class YouTube:
         drawer = ImageDraw.Draw(Image.new("RGBA", (10, 10), (0, 0, 0, 0)))
         words = raw.split()
         if len(words) <= 1:
+            prepared_raw, draw_kwargs = self._prepare_text_for_pil(raw)
             try:
                 drawer.multiline_textbbox(
                     (0, 0),
-                    raw,
+                    prepared_raw,
                     font=font,
                     stroke_width=stroke_width,
                     spacing=10,
                     align="center",
-                    **self._get_pil_subtitle_draw_kwargs(raw),
+                    **draw_kwargs,
                 )
-                return raw, self._get_pil_subtitle_draw_kwargs(raw)
+                return prepared_raw, draw_kwargs
             except Exception:
-                fallback = self._fallback_rtl_visual_order(raw)
+                fallback = self._prepare_text_for_pil(raw)[0] or self._fallback_rtl_visual_order(raw)
                 return fallback, {}
 
         lines: list[str] = []
         current = words[0]
-        draw_kwargs = self._get_pil_subtitle_draw_kwargs(raw)
         for word in words[1:]:
             candidate = f"{current} {word}".strip()
+            prepared_candidate, draw_kwargs = self._prepare_text_for_pil(candidate)
             try:
                 bbox = drawer.multiline_textbbox(
                     (0, 0),
-                    candidate,
+                    prepared_candidate,
                     font=font,
                     stroke_width=stroke_width,
                     spacing=10,
@@ -4427,17 +5279,17 @@ class YouTube:
                 )
             except Exception:
                 draw_kwargs = {}
-                candidate = self._fallback_rtl_visual_order(candidate)
+                prepared_candidate = self._fallback_rtl_visual_order(candidate)
                 bbox = drawer.multiline_textbbox(
                     (0, 0),
-                    candidate,
+                    prepared_candidate,
                     font=font,
                     stroke_width=stroke_width,
                     spacing=10,
                     align="center",
                 )
             if (bbox[2] - bbox[0]) <= max_width:
-                current = candidate if draw_kwargs else self._fallback_rtl_visual_order(f"{current} {word}".strip())
+                current = candidate
                 continue
             lines.append(current)
             current = word
@@ -4446,9 +5298,11 @@ class YouTube:
             lines.append(current)
 
         wrapped = "\n".join(lines)
-        if not draw_kwargs and self._contains_arabic_text(raw):
-            wrapped = self._fallback_rtl_visual_order(raw)
-        return wrapped, draw_kwargs
+        prepared_wrapped, draw_kwargs = self._prepare_text_for_pil(wrapped)
+        if not prepared_wrapped and self._contains_arabic_text(raw):
+            prepared_wrapped = self._fallback_rtl_visual_order(wrapped)
+            draw_kwargs = {}
+        return prepared_wrapped or wrapped, draw_kwargs
 
     def _create_subtitle_bitmap(self, text: str) -> np.ndarray:
         """
@@ -4510,7 +5364,7 @@ class YouTube:
         Returns:
             image (Image.Image): transparent RGBA text image
         """
-        if self._contains_arabic_text(text):
+        if self._should_use_arabic_subtitle_rendering(text):
             try:
                 return self._render_arabic_subtitle_with_imagemagick(
                     text,
@@ -4576,43 +5430,229 @@ class YouTube:
         """
         magick_path = get_imagemagick_path()
         font_path = self._get_subtitle_font_filename_for_text(text)
+        # Extract font family name for Pango (e.g., "Tahoma" from "C:\Windows\Fonts\tahoma.ttf")
+        # Pango needs font family names, not file paths, for proper Arabic text shaping
+        font_basename = os.path.basename(font_path)
+        font_name_no_ext = os.path.splitext(font_basename)[0]
+        # Capitalize first letter for font family name (tahoma -> Tahoma)
+        font_family = font_name_no_ext.capitalize() if font_name_no_ext else "Tahoma"
+
         point_size = max(24, int(get_subtitle_font_size()))
         rgba_fill = str(get_subtitle_color())
         render_text = self._shape_subtitle_text_for_rendering(text)
 
-        common = [
+        # Use Pango for proper Arabic text shaping (connected letters, RTL)
+        # Pango handles bidirectional text and Arabic letter joining correctly
+        pango_args = [
             magick_path,
             "-background",
             "none",
             "-fill",
             rgba_fill,
-            "-stroke",
-            "none",
-            "-strokewidth",
-            "0",
             "-font",
-            font_path,
+            font_family,
             "-pointsize",
             str(point_size),
             "-gravity",
             "center",
-        ]
-
-        label_args = [*common, f"label:{render_text}", "png:-"]
-        result = subprocess.run(label_args, capture_output=True, check=True)
-        image = Image.open(io.BytesIO(result.stdout)).convert("RGBA")
-        if image.width <= max_width:
-            return image
-
-        caption_args = [
-            *common,
             "-size",
             f"{max_width}x",
-            f"caption:{render_text}",
+            f"pango:{render_text}",
             "png:-",
         ]
-        wrapped = subprocess.run(caption_args, capture_output=True, check=True)
-        return Image.open(io.BytesIO(wrapped.stdout)).convert("RGBA")
+
+        try:
+            wrapped = subprocess.run(pango_args, capture_output=True, check=True)
+            return Image.open(io.BytesIO(wrapped.stdout)).convert("RGBA")
+        except subprocess.CalledProcessError as e:
+            # Fallback to caption: if pango fails (e.g., Pango not available)
+            warning(f"Pango rendering failed, falling back to caption: {e.stderr}")
+            font_path_normalized = font_path.replace("\\", "/")
+            caption_args = [
+                magick_path,
+                "-background",
+                "none",
+                "-fill",
+                rgba_fill,
+                "-font",
+                font_path_normalized,
+                "-pointsize",
+                str(point_size),
+                "-gravity",
+                "center",
+                "-size",
+                f"{max_width}x",
+                f"caption:{render_text}",
+                "png:-",
+            ]
+            wrapped = subprocess.run(caption_args, capture_output=True, check=True)
+            return Image.open(io.BytesIO(wrapped.stdout)).convert("RGBA")
+
+    def _hex_to_ass_color(self, hex_color: str, alpha: int = 0) -> str:
+        """
+        Converts a hex color (#RRGGBB) to ASS format (&HAABBGGRR).
+
+        Args:
+            hex_color (str): hex color like #FFF7D6
+            alpha (int): alpha value 0-255 (0=opaque, 255=transparent)
+
+        Returns:
+            ass_color (str): ASS color format &HAABBGGRR
+        """
+        hex_color = str(hex_color or "#FFFFFF").strip().lstrip("#")
+        if len(hex_color) == 3:
+            hex_color = "".join(c * 2 for c in hex_color)
+        if len(hex_color) != 6:
+            hex_color = "FFFFFF"
+
+        r = hex_color[0:2]
+        g = hex_color[2:4]
+        b = hex_color[4:6]
+        # ASS format is &HAABBGGRR (alpha, blue, green, red)
+        return f"&H{alpha:02X}{b}{g}{r}"
+
+    def _generate_ass_subtitles(
+        self,
+        subtitle_entries: list[tuple[tuple[float, float], str]],
+        output_path: str,
+    ) -> str:
+        """
+        Generates an ASS (Advanced SubStation Alpha) subtitle file from entries.
+        ASS format supports custom fonts, colors, outlines, and proper RTL text.
+
+        Args:
+            subtitle_entries (list): timed subtitle entries
+            output_path (str): output ASS file path
+
+        Returns:
+            path (str): path to generated ASS file
+        """
+        # Get styling from config
+        font_size = max(24, int(get_subtitle_font_size()))
+        primary_color = self._hex_to_ass_color(get_subtitle_color(), alpha=0)
+        outline_color = self._hex_to_ass_color(get_subtitle_stroke_color(), alpha=0)
+        back_color = self._hex_to_ass_color("#000000", alpha=150)  # Semi-transparent background
+        outline_width = max(0, int(get_subtitle_stroke_width()))
+
+        # Get font family name
+        sample_text = subtitle_entries[0][1] if subtitle_entries else ""
+        font_path = self._get_subtitle_font_filename_for_text(sample_text)
+        font_basename = os.path.basename(font_path)
+        font_name = os.path.splitext(font_basename)[0].capitalize()
+        if not font_name:
+            font_name = "Tahoma"
+
+        # Position from bottom (1920 - desired_y_position)
+        # word_by_word uses y=1510, chunk uses y=1450
+        subtitle_y = 1510 if get_subtitle_mode() == "word_by_word" else 1450
+        margin_v = 1920 - subtitle_y - 50  # Margin from bottom
+
+        # ASS header
+        ass_content = f"""[Script Info]
+Title: Generated Subtitles
+ScriptType: v4.00+
+PlayResX: 1080
+PlayResY: 1920
+WrapStyle: 0
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,{font_name},{font_size},{primary_color},&H000000FF,{outline_color},{back_color},-1,0,0,0,100,100,0,0,1,{outline_width},0,2,10,10,{margin_v},1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+"""
+
+        # Convert entries to ASS dialogue lines
+        for (start_time, end_time), text in subtitle_entries:
+            start_ass = self._seconds_to_ass_timestamp(start_time)
+            end_ass = self._seconds_to_ass_timestamp(end_time)
+            # Escape special ASS characters and normalize text
+            clean_text = str(text or "").strip()
+            clean_text = clean_text.replace("\\", "\\\\").replace("{", "\\{").replace("}", "\\}")
+            clean_text = clean_text.replace("\n", "\\N")
+            ass_content += f"Dialogue: 0,{start_ass},{end_ass},Default,,0,0,0,,{clean_text}\n"
+
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write(ass_content)
+
+        return output_path
+
+    def _seconds_to_ass_timestamp(self, seconds: float) -> str:
+        """
+        Converts seconds to ASS timestamp format (H:MM:SS.cc).
+
+        Args:
+            seconds (float): time in seconds
+
+        Returns:
+            timestamp (str): ASS format timestamp
+        """
+        seconds = max(0.0, float(seconds or 0.0))
+        hours = int(seconds // 3600)
+        minutes = int((seconds % 3600) // 60)
+        secs = int(seconds % 60)
+        centiseconds = int((seconds * 100) % 100)
+        return f"{hours}:{minutes:02d}:{secs:02d}.{centiseconds:02d}"
+
+    def _burn_subtitles_with_ffmpeg(
+        self,
+        video_path: str,
+        ass_path: str,
+        output_path: str,
+    ) -> str:
+        """
+        Burns ASS subtitles into video using FFmpeg's subtitle filter.
+        This is much faster than MoviePy's per-frame overlay compositing.
+
+        Args:
+            video_path (str): input video path
+            ass_path (str): ASS subtitle file path
+            output_path (str): output video path
+
+        Returns:
+            path (str): path to output video with burned subtitles
+        """
+        # Normalize paths for FFmpeg on Windows (use forward slashes and escape colons)
+        ass_path_normalized = ass_path.replace("\\", "/")
+        # FFmpeg subtitles filter needs special escaping for Windows paths
+        # Colons in drive letters need escaping, and backslashes need double escaping
+        ass_path_escaped = ass_path_normalized.replace(":", "\\:")
+
+        # Determine encoder
+        encoder = "libx264"
+        encoder_params = ["-preset", "veryfast"]
+        if self._ffmpeg_supports_encoder("h264_nvenc"):
+            encoder = "h264_nvenc"
+            encoder_params = []
+
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", video_path,
+            "-vf", f"subtitles='{ass_path_escaped}'",
+            "-c:v", encoder,
+            *encoder_params,
+            "-c:a", "copy",
+            "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart",
+            output_path,
+        ]
+
+        if get_verbose():
+            info(f" => Burning subtitles into video via FFmpeg ({encoder})...")
+
+        try:
+            result = subprocess.run(
+                cmd,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        except subprocess.CalledProcessError as e:
+            warning(f"FFmpeg subtitle burn failed: {e.stderr}")
+            raise
+
+        return output_path
 
     def _build_subtitle_overlay_clips(
         self,
@@ -4873,7 +5913,8 @@ class YouTube:
         final_clip = concatenate_videoclips(clips, method="compose")
         final_clip = final_clip.set_fps(get_video_fps())
 
-        subtitle_overlay_clips = []
+        # Generate subtitles and prepare ASS file for FFmpeg burning
+        ass_subtitles_path = None
         try:
             subtitles_path = self.generate_subtitles(self.tts_path)
             if self._should_equalize_subtitles():
@@ -4881,14 +5922,17 @@ class YouTube:
             subtitle_entries = self._parse_srt_entries_utf8(subtitles_path)
             if not subtitle_entries:
                 raise RuntimeError("Subtitle file was empty after generation.")
-            subtitle_overlay_clips = self._build_subtitle_overlay_clips(subtitle_entries)
+            # Generate ASS file for FFmpeg subtitle burning (much faster than MoviePy overlay)
+            ass_subtitles_path = self._get_workspace_path("subtitles.ass")
+            self._generate_ass_subtitles(subtitle_entries, ass_subtitles_path)
             self._emit_progress(
                 "subtitles",
-                f"Prepared {len(subtitle_entries)} subtitle entries.",
-                {"subtitle_entries": len(subtitle_entries), "subtitles_path": subtitles_path},
+                f"Prepared {len(subtitle_entries)} subtitle entries for FFmpeg burning.",
+                {"subtitle_entries": len(subtitle_entries), "subtitles_path": ass_subtitles_path},
             )
         except Exception as e:
             warning(f"Failed to generate subtitles, continuing without subtitles: {e}")
+            ass_subtitles_path = None
 
         audio_layers = [tts_clip.set_fps(44100)]
 
@@ -4915,22 +5959,55 @@ class YouTube:
         final_clip = final_clip.set_audio(final_audio)
         final_clip = final_clip.set_duration(tts_clip.duration)
 
-        if subtitle_overlay_clips:
-            final_clip = CompositeVideoClip([final_clip, *subtitle_overlay_clips])
-
+        # Render video WITHOUT subtitles first (fast)
+        # Subtitles will be burned in via FFmpeg in a second pass
         export_codec, export_ffmpeg_params = self._get_video_export_settings()
-        self._emit_progress(
-            "render",
-            f"Writing final video with {export_codec}.",
-            {"codec": export_codec, "output_path": combined_image_path},
-        )
-        final_clip.write_videofile(
-            combined_image_path,
-            threads=threads,
-            codec=export_codec,
-            audio_codec="aac",
-            ffmpeg_params=export_ffmpeg_params,
-        )
+
+        if ass_subtitles_path and os.path.exists(ass_subtitles_path):
+            # Render to temp file first, then burn subtitles
+            temp_video_path = self._get_workspace_path("video_no_subs.mp4")
+            self._emit_progress(
+                "render",
+                f"Writing base video with {export_codec} (subtitles will be burned in next).",
+                {"codec": export_codec, "output_path": temp_video_path},
+            )
+            final_clip.write_videofile(
+                temp_video_path,
+                threads=threads,
+                codec=export_codec,
+                audio_codec="aac",
+                ffmpeg_params=export_ffmpeg_params,
+                logger=self._build_moviepy_render_logger(),
+            )
+
+            # Burn subtitles into final video using FFmpeg
+            self._emit_progress(
+                "subtitles_burn",
+                "Burning subtitles into video via FFmpeg...",
+                {"ass_path": ass_subtitles_path},
+            )
+            self._burn_subtitles_with_ffmpeg(temp_video_path, ass_subtitles_path, combined_image_path)
+
+            # Clean up temp file
+            try:
+                os.remove(temp_video_path)
+            except OSError:
+                pass
+        else:
+            # No subtitles - render directly to final path
+            self._emit_progress(
+                "render",
+                f"Writing final video with {export_codec}.",
+                {"codec": export_codec, "output_path": combined_image_path},
+            )
+            final_clip.write_videofile(
+                combined_image_path,
+                threads=threads,
+                codec=export_codec,
+                audio_codec="aac",
+                ffmpeg_params=export_ffmpeg_params,
+                logger=self._build_moviepy_render_logger(),
+            )
 
         success(f'Wrote Video to "{combined_image_path}"')
         self.video_path = os.path.abspath(combined_image_path)
@@ -5036,10 +6113,96 @@ class YouTube:
             info(" => Using libx264 veryfast preset for final video export", show_emoji=False)
         return "libx264", ["-preset", "veryfast", *common_params]
 
+    def _build_moviepy_render_logger(self):
+        """
+        Returns a MoviePy logger for the active execution environment.
+
+        Returns:
+            logger: default terminal logger or GUI-friendly progress logger
+        """
+        if not callable(self._progress_callback):
+            return "bar"
+
+        owner = self
+
+        class GuiRenderLogger(ProgressBarLogger):
+            def __init__(self):
+                super().__init__(logged_bars=False, min_time_interval=0)
+
+            def bars_callback(self, bar, attr, value, old_value=None):
+                if bar != "t":
+                    return
+
+                total = float(self.bars.get(bar, {}).get("total") or 0.0)
+                current = float(self.bars.get(bar, {}).get("index") or 0.0)
+                if total <= 0:
+                    return
+
+                progress = max(0.0, min(1.0, current / total))
+                owner._emit_progress(
+                    "render_progress",
+                    f"Rendering final video... {int(progress * 100)}%",
+                    {
+                        "progress": progress,
+                        "current": int(current),
+                        "total": int(total),
+                    },
+                )
+
+        return GuiRenderLogger()
+
+    def _safe_audio_clip_to_soundarray(
+        self,
+        clip,
+        fps: int = 44100,
+        quantize: bool = False,
+        nbytes: int = 2,
+        buffersize: int = 50000,
+    ) -> np.ndarray:
+        """
+        Converts an audio clip into a numpy array without relying on MoviePy's
+        generator stacking path that breaks on newer NumPy versions.
+
+        Args:
+            clip: MoviePy audio clip
+            fps (int): sample rate
+            quantize (bool): whether to quantize samples
+            nbytes (int): bytes per sample when quantized
+            buffersize (int): chunk size used for long clips
+
+        Returns:
+            samples (np.ndarray): audio waveform samples
+        """
+        clip_duration = float(getattr(clip, "duration", 0.0) or 0.0)
+        nchannels = int(getattr(clip, "nchannels", 1) or 1)
+        stacker = np.vstack if nchannels == 2 else np.hstack
+        max_duration = float(buffersize) / float(fps)
+
+        if clip_duration > max_duration:
+            chunks = list(
+                clip.iter_chunks(
+                    fps=fps,
+                    quantize=quantize,
+                    nbytes=nbytes,
+                    chunksize=buffersize,
+                )
+            )
+            if not chunks:
+                return np.array([], dtype=np.float32)
+            return stacker(chunks)
+
+        return clip.to_soundarray(
+            fps=fps,
+            quantize=quantize,
+            nbytes=nbytes,
+            buffersize=buffersize,
+        )
+
     def _apply_audio_ducking(self, voice_clip, music_clip, voice_vol=0.15, silence_vol=0.4):
         """
-        Applies audio ducking to the music clip based on the voice clip's amplitude.
-        Music volume dips during speech and rises during pauses.
+        Applies audio ducking by pre-rendering the music with a volume envelope
+        to a WAV file, then loading it back as an AudioFileClip.
+        This avoids MoviePy's per-frame .fl() filter which is extremely slow.
 
         Args:
             voice_clip: TTS AudioFileClip
@@ -5048,35 +6211,39 @@ class YouTube:
             silence_vol (float): Music volume multiplier during silence
 
         Returns:
-            ducked_music: AudioFileClip with dynamic volume
+            ducked_music: AudioFileClip with baked-in ducking
         """
         try:
+            import soundfile as sf
+
             fps = 44100
-            voice_array = voice_clip.to_soundarray(fps=fps)
+            voice_array = self._safe_audio_clip_to_soundarray(voice_clip, fps=fps)
+            if voice_array.size == 0:
+                raise RuntimeError("Voice clip did not contain any audio samples.")
+
             if voice_array.ndim > 1:
                 voice_mono = np.mean(voice_array, axis=1)
             else:
                 voice_mono = voice_array
 
             # Compute RMS energy in 50ms windows
-            window_size = int(fps * 0.05)
-            num_windows = len(voice_mono) // window_size
+            window_size = max(1, int(fps * 0.05))
+            total_samples = len(voice_mono)
             rms = np.array([
-                np.sqrt(np.mean(voice_mono[i * window_size:(i + 1) * window_size] ** 2))
-                for i in range(num_windows)
+                np.sqrt(np.mean(voice_mono[start:end] ** 2))
+                for start in range(0, total_samples, window_size)
+                for end in [min(start + window_size, total_samples)]
             ])
 
-            # Threshold: consider speech present when RMS > 15% of max RMS
             threshold = np.max(rms) * 0.15 if np.max(rms) > 0 else 0
             is_speech = rms > threshold
 
             # Build per-sample volume envelope
-            total_samples = len(voice_mono)
             volume_envelope = np.ones(total_samples) * silence_vol
-            for i in range(num_windows):
-                start = i * window_size
-                end = min((i + 1) * window_size, total_samples)
-                if is_speech[i]:
+            for window_index, speech_present in enumerate(is_speech):
+                start = window_index * window_size
+                end = min((window_index + 1) * window_size, total_samples)
+                if speech_present:
                     volume_envelope[start:end] = voice_vol
 
             # Smooth the envelope to avoid clicks (100ms fade)
@@ -5085,13 +6252,27 @@ class YouTube:
                 kernel = np.ones(smooth_window) / smooth_window
                 volume_envelope = np.convolve(volume_envelope, kernel, mode="same")
 
-            def ducking_filter(get_frame, t):
-                frame = get_frame(t)
-                sample_idx = int(t * fps)
-                sample_idx = min(sample_idx, len(volume_envelope) - 1)
-                return frame * volume_envelope[sample_idx]
+            # Pre-render: apply envelope to music samples and write to WAV
+            music_array = self._safe_audio_clip_to_soundarray(music_clip, fps=fps)
+            if music_array.size == 0:
+                raise RuntimeError("Music clip did not contain any audio samples.")
 
-            return music_clip.fl(ducking_filter)
+            # Trim or pad envelope to match music length
+            music_len = len(music_array)
+            if len(volume_envelope) < music_len:
+                volume_envelope = np.pad(volume_envelope, (0, music_len - len(volume_envelope)), constant_values=silence_vol)
+            else:
+                volume_envelope = volume_envelope[:music_len]
+
+            if music_array.ndim > 1:
+                ducked = music_array * volume_envelope.reshape(-1, 1)
+            else:
+                ducked = music_array * volume_envelope
+
+            ducked_path = self._get_workspace_path("ducked_music.wav")
+            sf.write(ducked_path, ducked.astype(np.float32), fps)
+
+            return AudioFileClip(ducked_path).set_fps(fps)
         except Exception as e:
             warning(f"Audio ducking failed, using flat volume: {e}")
             return music_clip.fx(afx.volumex, voice_vol)
@@ -5125,23 +6306,11 @@ class YouTube:
         for trigger, sfx_file in sfx_map.items():
             normalized_map[strip_word(trigger)] = sfx_file
 
-        # Get word-level timestamps from Whisper
+        # Get word-level timestamps from cached Whisper transcription
         try:
-            from faster_whisper import WhisperModel
-
-            device = get_whisper_device()
-            compute_type = get_whisper_compute_type()
-            try:
-                model = WhisperModel(get_whisper_model(), device=device, compute_type=compute_type)
-            except Exception:
-                model = WhisperModel(get_whisper_model(), device="cpu", compute_type="int8")
-
-            transcription_language = self._get_transcription_language_code()
-            transcribe_kwargs = {"vad_filter": True, "task": "transcribe", "word_timestamps": True}
-            if transcription_language:
-                transcribe_kwargs["language"] = transcription_language
-
-            segments, _ = model.transcribe(audio_path, **transcribe_kwargs)
+            segments, _, _, _ = self._transcribe_with_whisper(
+                audio_path, word_timestamps=True,
+            )
 
             words_with_times = []
             for segment in segments:
@@ -5210,12 +6379,26 @@ class YouTube:
         self._pixabay_selection_debug = []
 
         # Generate the Metadata
-        self._emit_progress("metadata_start", "Generating metadata...")
-        self.generate_metadata()
+        if self._manual_metadata_locked and isinstance(getattr(self, "metadata", None), dict) and self.metadata.get("title"):
+            self._emit_progress(
+                "metadata",
+                "Using provided YouTube metadata.",
+                {"metadata": self.metadata},
+            )
+        else:
+            self._emit_progress("metadata_start", "Generating metadata...")
+            self.generate_metadata()
 
         # Generate the Image Prompts
-        self._emit_progress("prompts_start", "Generating scene image prompts...")
-        self.generate_prompts()
+        if self._manual_scene_data_locked and getattr(self, "image_prompts", None) and getattr(self, "scene_units", None):
+            self._emit_progress(
+                "image_prompts",
+                f"Using {len(self.image_prompts)} provided scene prompts.",
+                {"image_prompts": self.image_prompts},
+            )
+        else:
+            self._emit_progress("prompts_start", "Generating scene image prompts...")
+            self.generate_prompts()
 
         self._emit_progress("assets_start", "Generating visual assets...")
         generated_assets = self._generate_visual_assets()
@@ -5285,6 +6468,404 @@ class YouTube:
         """
         self.set_manual_script(script, subject)
         return self._render_video_assets(tts_instance)
+
+    def generate_video_from_editor(
+        self,
+        tts_instance: TTS,
+        script: str,
+        subject: str = "",
+        metadata: dict | None = None,
+        scene_units: list[str] | None = None,
+        image_prompts: list[str] | None = None,
+    ) -> str:
+        """
+        Generates a video from caller-edited script, metadata, and scene data.
+
+        Args:
+            tts_instance (TTS): TTS provider instance
+            script (str): final narration script
+            subject (str): subject/topic
+            metadata (dict | None): optional metadata override
+            scene_units (list[str] | None): optional scene transcript chunks
+            image_prompts (list[str] | None): optional scene prompts
+
+        Returns:
+            path (str): final generated video path
+        """
+        self.set_manual_script(script, subject)
+        if metadata is not None:
+            self.set_manual_metadata(metadata)
+        if scene_units is not None or image_prompts is not None:
+            self.set_manual_scene_data(scene_units, image_prompts)
+        return self._render_video_assets(tts_instance)
+
+    def rebuild_video_from_workspace(
+        self,
+        tts_instance: TTS | None = None,
+        workspace_dir: str | None = None,
+        *,
+        regenerate_voiceover: bool = False,
+        regenerate_assets: bool = False,
+    ) -> str:
+        """
+        Rebuilds a saved workspace after editor changes.
+
+        Args:
+            tts_instance (TTS | None): optional TTS instance for fresh voiceover
+            workspace_dir (str | None): optional workspace path override
+            regenerate_voiceover (bool): whether to synthesize new narration audio
+            regenerate_assets (bool): whether to regenerate visual assets
+
+        Returns:
+            path (str): rebuilt video path
+        """
+        if workspace_dir:
+            self.load_workspace_state(workspace_dir)
+
+        if regenerate_assets:
+            self.images = []
+            self.visual_assets = []
+            self._pixabay_selection_debug = []
+            self._emit_progress("assets_start", "Regenerating visual assets from edited scenes...")
+            generated_assets = self._generate_visual_assets()
+            if generated_assets == 0:
+                raise RuntimeError(
+                    "Visual asset regeneration failed for all edited scenes."
+                )
+
+        if regenerate_voiceover or not str(getattr(self, "tts_path", "") or "").strip() or not os.path.exists(self.tts_path):
+            self._emit_progress("tts_start", "Regenerating voiceover audio...")
+            self.generate_script_to_speech(tts_instance or TTS())
+
+        if not str(getattr(self, "tts_path", "") or "").strip() or not os.path.exists(self.tts_path):
+            raise RuntimeError("This workspace does not contain a saved voiceover, so the video cannot be rebuilt.")
+
+        self._emit_progress("render_start", "Rebuilding the final video from the edited draft...")
+        path = self.combine()
+
+        pricing_report = self._write_pricing_report()
+        if isinstance(getattr(self, "metadata", None), dict):
+            self.metadata["pricing"] = pricing_report
+        self._write_workspace_state()
+        return path
+
+    def regenerate_scene_asset(
+        self,
+        scene_index: int,
+        provider: str,
+        workspace_dir: str | None = None,
+    ) -> dict:
+        """
+        Replaces a single scene asset using either Pixabay or Nano Banana.
+
+        Args:
+            scene_index (int): zero-based scene order
+            provider (str): pixabay or nanobanana2
+            workspace_dir (str | None): optional workspace override
+
+        Returns:
+            asset (dict): stored asset payload for the regenerated scene
+        """
+        if workspace_dir:
+            self.load_workspace_state(workspace_dir)
+
+        scene_units = list(getattr(self, "scene_units", []) or [])
+        image_prompts = list(getattr(self, "image_prompts", []) or [])
+        if scene_index < 0 or scene_index >= len(scene_units):
+            raise RuntimeError(f"Scene {scene_index + 1} is out of range for this draft.")
+
+        scene_text = str(scene_units[scene_index] or "").strip()
+        prompt_text = (
+            str(image_prompts[scene_index] or "").strip()
+            if scene_index < len(image_prompts)
+            else self._make_provider_friendly_image_prompt(scene_text)
+        )
+        normalized_provider = str(provider or "").strip().lower()
+        self._emit_progress(
+            "assets_start",
+            f"Regenerating asset for scene {scene_index + 1} using {normalized_provider}.",
+            {
+                "scene_index": scene_index,
+                "provider": normalized_provider,
+            },
+        )
+
+        if normalized_provider == "pixabay":
+            preferred_durations = self._estimate_scene_durations_for_asset_search()
+            preferred_duration = (
+                preferred_durations[scene_index]
+                if scene_index < len(preferred_durations)
+                else None
+            )
+            intents, global_context = self._build_scene_stock_intents([scene_text], [prompt_text])
+            scene_intent = intents[0] if intents else self._build_fallback_scene_stock_intent(
+                scene_index=scene_index,
+                scene_text=scene_text,
+                prompt_text=prompt_text,
+                global_context=global_context,
+            )
+            candidates = self._collect_pixabay_scene_candidates(
+                scene_intent,
+                preferred_duration=preferred_duration,
+            )
+            approved_candidate = next(
+                (candidate for candidate in candidates if self._pixabay_candidate_meets_quality_threshold(candidate)),
+                None,
+            )
+            if approved_candidate is None:
+                raise RuntimeError(
+                    f"No Pixabay asset passed the {PIXBAY_MIN_SELECTION_SCORE:.0f}% quality threshold for scene {scene_index + 1}."
+                )
+
+            asset_bytes = self._download_url_bytes(approved_candidate["asset_url"])
+            if not asset_bytes:
+                raise RuntimeError("Pixabay returned an empty asset payload.")
+
+            if approved_candidate["asset_type"] == "video":
+                filename = (
+                    f"stock_video_{len(self.visual_assets)+1:02d}_"
+                    f"{approved_candidate.get('hit_id') or 'pixabay'}_"
+                    f"{approved_candidate.get('asset_variant') or 'clip'}.mp4"
+                )
+            else:
+                filename = f"stock_image_{len(self.visual_assets)+1:02d}_{approved_candidate.get('hit_id') or 'pixabay'}.jpg"
+
+            path = self._persist_binary_asset(
+                asset_bytes,
+                filename,
+                "Pixabay",
+                approved_candidate["asset_type"],
+                scene_index=scene_index,
+            )
+            self._record_stock_asset_cost("pixabay", approved_candidate["asset_type"], scene_index=scene_index)
+            asset_record = dict(self.visual_assets[-1])
+            asset_record.update(
+                {
+                    "pixabay_hit_id": approved_candidate.get("hit_id"),
+                    "pixabay_query": approved_candidate.get("best_query"),
+                    "pixabay_query_type": approved_candidate.get("best_query_type"),
+                    "pixabay_tags": approved_candidate.get("top_tags", []),
+                    "path": path,
+                }
+            )
+            return self._replace_scene_asset_record(scene_index, asset_record)
+
+        if normalized_provider in {"nanobanana2", "nano_banana", "nano banana", "ai"}:
+            generated_path = self.generate_image_nanobanana2(prompt_text, scene_index=scene_index)
+            if not generated_path:
+                raise RuntimeError(f"Nano Banana could not generate a replacement for scene {scene_index + 1}.")
+            return self._replace_scene_asset_record(scene_index, dict(self.visual_assets[-1]))
+
+        raise RuntimeError(f'Unsupported scene asset provider "{provider}".')
+
+    def list_pixabay_scene_candidates(
+        self,
+        scene_index: int,
+        workspace_dir: str | None = None,
+        limit: int = 8,
+    ) -> dict:
+        """
+        Returns the top Pixabay candidates for one scene without changing the
+        stored asset yet.
+
+        Args:
+            scene_index (int): zero-based scene order
+            workspace_dir (str | None): optional workspace override
+            limit (int): max number of candidates to return
+
+        Returns:
+            payload (dict): scene context and candidate list
+        """
+        if workspace_dir:
+            self.load_workspace_state(workspace_dir)
+
+        scene_units = list(getattr(self, "scene_units", []) or [])
+        image_prompts = list(getattr(self, "image_prompts", []) or [])
+        if scene_index < 0 or scene_index >= len(scene_units):
+            raise RuntimeError(f"Scene {scene_index + 1} is out of range for this draft.")
+
+        scene_text = str(scene_units[scene_index] or "").strip()
+        prompt_text = (
+            str(image_prompts[scene_index] or "").strip()
+            if scene_index < len(image_prompts)
+            else self._make_provider_friendly_image_prompt(scene_text)
+        )
+        preferred_durations = self._estimate_scene_durations_for_asset_search()
+        preferred_duration = (
+            preferred_durations[scene_index]
+            if scene_index < len(preferred_durations)
+            else None
+        )
+        intents, global_context = self._build_scene_stock_intents([scene_text], [prompt_text])
+        scene_intent = intents[0] if intents else self._build_fallback_scene_stock_intent(
+            scene_index=scene_index,
+            scene_text=scene_text,
+            prompt_text=prompt_text,
+            global_context=global_context,
+        )
+        ranked_candidates = self._collect_pixabay_scene_candidates(
+            scene_intent,
+            preferred_duration=preferred_duration,
+            max_query_variants=3,
+        )
+        candidates = [
+            candidate
+            for candidate in ranked_candidates
+            if self._pixabay_candidate_meets_quality_threshold(candidate)
+        ][: max(1, int(limit or 8))]
+        search_mode = "primary"
+
+        if not candidates:
+            widened_intent = dict(scene_intent)
+            widened_query_variants = []
+            seen_queries = set()
+
+            def add_variant(variant_type: str, query: str) -> None:
+                cleaned_query = self._format_pixabay_q_value(
+                    re.split(r"\s*\+\s*", str(query or "").strip())
+                )
+                if not cleaned_query or cleaned_query in seen_queries:
+                    return
+                seen_queries.add(cleaned_query)
+                widened_query_variants.append(
+                    {
+                        "type": str(variant_type or "variant").strip() or "variant",
+                        "query": cleaned_query,
+                    }
+                )
+
+            for variant in list(scene_intent.get("query_variants", []) or []):
+                if isinstance(variant, dict):
+                    add_variant(variant.get("type", "variant"), variant.get("query", ""))
+
+            fallback_intent = self._build_fallback_scene_stock_intent(
+                scene_index=scene_index,
+                scene_text=scene_text,
+                prompt_text=prompt_text,
+                global_context=global_context,
+            )
+            for variant in list(fallback_intent.get("query_variants", []) or []):
+                if isinstance(variant, dict):
+                    add_variant(variant.get("type", "scene_fallback"), variant.get("query", ""))
+
+            add_variant("subject_scene_retry", self.subject)
+            add_variant("scene_text_retry", scene_text)
+            widened_intent["query_variants"] = widened_query_variants
+            widened_intent["query_generation_note"] = (
+                str(scene_intent.get("query_generation_note", "") or "").strip()
+                + " Widened search retried with fallback scene queries."
+            ).strip()
+
+            ranked_candidates = self._collect_pixabay_scene_candidates(
+                widened_intent,
+                preferred_duration=preferred_duration,
+                max_query_variants=5,
+            )
+            search_mode = "widened_retry"
+            candidates = [
+                candidate
+                for candidate in ranked_candidates
+                if self._pixabay_candidate_meets_quality_threshold(candidate)
+            ][: max(1, int(limit or 8))]
+            if candidates:
+                scene_intent = widened_intent
+            else:
+                scene_intent = widened_intent
+
+        return {
+            "scene_index": scene_index,
+            "scene_text": scene_text,
+            "prompt_text": prompt_text,
+            "preferred_duration": preferred_duration,
+            "pixabay_query_source": scene_intent.get("pixabay_query_source", "heuristic"),
+            "query_generation_note": scene_intent.get("query_generation_note", ""),
+            "search_mode": search_mode,
+            "query_variants": [
+                {
+                    "type": str(variant.get("type", "") or "").strip(),
+                    "query": str(variant.get("query", "") or "").strip(),
+                }
+                for variant in list(scene_intent.get("query_variants", []) or [])
+                if isinstance(variant, dict)
+            ],
+            "candidates": [
+                {
+                    "asset_type": candidate.get("asset_type"),
+                    "asset_url": candidate.get("asset_url"),
+                    "asset_variant": candidate.get("asset_variant"),
+                    "hit_id": candidate.get("hit_id"),
+                    "best_query": candidate.get("best_query"),
+                    "best_query_type": candidate.get("best_query_type"),
+                    "top_tags": list(candidate.get("top_tags", []) or []),
+                    "user_display": candidate.get("user_display"),
+                    "selection_score": round(float(self._get_pixabay_selection_score(candidate)), 3),
+                    "preview_url": candidate.get("asset_url"),
+                    "duration": round(float(candidate.get("duration", 0.0) or 0.0), 3),
+                }
+                for candidate in candidates
+            ],
+        }
+
+    def replace_scene_asset_with_pixabay_candidate(
+        self,
+        scene_index: int,
+        candidate_payload: dict,
+        workspace_dir: str | None = None,
+    ) -> dict:
+        """
+        Downloads one user-selected Pixabay candidate and links it to a scene.
+
+        Args:
+            scene_index (int): zero-based scene order
+            candidate_payload (dict): selected Pixabay candidate summary
+            workspace_dir (str | None): optional workspace override
+
+        Returns:
+            asset (dict): stored asset payload
+        """
+        if workspace_dir:
+            self.load_workspace_state(workspace_dir)
+
+        if not isinstance(candidate_payload, dict):
+            raise RuntimeError("A Pixabay candidate must be selected first.")
+
+        asset_url = str(candidate_payload.get("asset_url", "") or "").strip()
+        asset_type = str(candidate_payload.get("asset_type", "") or "").strip().lower()
+        if asset_type not in {"image", "video"} or not asset_url:
+            raise RuntimeError("The selected Pixabay candidate is missing the required asset information.")
+
+        asset_bytes = self._download_url_bytes(asset_url)
+        if not asset_bytes:
+            raise RuntimeError("Pixabay returned an empty asset payload.")
+
+        if asset_type == "video":
+            filename = (
+                f"stock_video_{len(self.visual_assets)+1:02d}_"
+                f"{candidate_payload.get('hit_id') or 'pixabay'}_"
+                f"{candidate_payload.get('asset_variant') or 'clip'}.mp4"
+            )
+        else:
+            filename = f"stock_image_{len(self.visual_assets)+1:02d}_{candidate_payload.get('hit_id') or 'pixabay'}.jpg"
+
+        path = self._persist_binary_asset(
+            asset_bytes,
+            filename,
+            "Pixabay",
+            asset_type,
+            scene_index=scene_index,
+        )
+        self._record_stock_asset_cost("pixabay", asset_type, scene_index=scene_index)
+        asset_record = dict(self.visual_assets[-1])
+        asset_record.update(
+            {
+                "pixabay_hit_id": candidate_payload.get("hit_id"),
+                "pixabay_query": candidate_payload.get("best_query"),
+                "pixabay_query_type": candidate_payload.get("best_query_type"),
+                "pixabay_tags": list(candidate_payload.get("top_tags", []) or []),
+                "path": path,
+            }
+        )
+        return self._replace_scene_asset_record(scene_index, asset_record)
 
     def get_channel_id(self) -> str:
         """

@@ -29,6 +29,7 @@ from llm_provider import list_models, select_model
 CONFIG_PATH = os.path.join(APP_ROOT_DIR, "config.json")
 YOUTUBE_DRAFTS_PATH = os.path.join(APP_ROOT_DIR, ".mp", "youtube_drafts.json")
 YOUTUBE_RUNS_PATH = os.path.join(APP_ROOT_DIR, ".mp", "youtube_runs")
+YOUTUBE_PIXABAY_PICKER_STATE_KEY = "youtube_pixabay_picker"
 
 
 def load_config() -> dict:
@@ -57,7 +58,116 @@ def save_youtube_drafts(payload: dict) -> None:
         json.dump(payload, file, indent=2, ensure_ascii=False)
 
 
-def save_youtube_draft(account_id: str, video_path: str, metadata: dict) -> None:
+def infer_youtube_workspace_dir(video_path: str = "", workspace_dir: str = "") -> str:
+    normalized_workspace = os.path.abspath(str(workspace_dir or "").strip()) if str(workspace_dir or "").strip() else ""
+    if normalized_workspace and os.path.exists(os.path.join(normalized_workspace, "run_state.json")):
+        return normalized_workspace
+
+    normalized_video_path = os.path.abspath(str(video_path or "").strip()) if str(video_path or "").strip() else ""
+    if not normalized_video_path:
+        return ""
+
+    candidate = os.path.dirname(normalized_video_path)
+    if os.path.exists(os.path.join(candidate, "run_state.json")):
+        return candidate
+    return ""
+
+
+def build_youtube_editor_payload(source_payload: dict | None = None) -> dict:
+    payload = dict(source_payload or {})
+    workspace_dir = infer_youtube_workspace_dir(
+        video_path=str(payload.get("video_path", "") or ""),
+        workspace_dir=str(payload.get("workspace_dir", "") or ""),
+    )
+    workspace_payload = load_youtube_run_state(workspace_dir) if workspace_dir else None
+    merged = dict(workspace_payload or {})
+    merged.update(payload)
+    if workspace_dir:
+        merged["workspace_dir"] = workspace_dir
+
+    def resolve_workspace_path(raw_path: str) -> str:
+        cleaned_path = str(raw_path or "").strip()
+        if not cleaned_path:
+            return ""
+        if os.path.isabs(cleaned_path):
+            return os.path.abspath(cleaned_path)
+        if workspace_dir:
+            return os.path.abspath(os.path.join(workspace_dir, cleaned_path))
+        return os.path.abspath(cleaned_path)
+
+    script_text = str(merged.get("script", "") or "").strip()
+    scene_units = [
+        str(item).strip()
+        for item in list(merged.get("scene_units", []) or [])
+        if str(item).strip()
+    ]
+    image_prompts = [
+        str(item).strip()
+        for item in list(merged.get("image_prompts", []) or [])
+        if str(item).strip()
+    ]
+
+    if not scene_units and script_text:
+        scene_units = [
+            part.strip(" \t\r\n-")
+            for part in re.split(r"(?<=[\.\!\?\u061f])\s+|\n+", script_text)
+            if part and part.strip()
+        ]
+
+    if not scene_units and image_prompts:
+        scene_units = [prompt for prompt in image_prompts]
+    if not image_prompts and scene_units:
+        image_prompts = [scene for scene in scene_units]
+
+    target_count = max(len(scene_units), len(image_prompts))
+    if target_count and len(scene_units) < target_count:
+        scene_units.extend(scene_units[-1:] * (target_count - len(scene_units)))
+    if target_count and len(image_prompts) < target_count:
+        fallback_prompt = image_prompts[-1] if image_prompts else scene_units[-1]
+        image_prompts.extend([fallback_prompt] * (target_count - len(image_prompts)))
+
+    visual_assets = {
+        int(asset.get("scene_index", -1)): asset
+        for asset in list(merged.get("visual_assets", []) or [])
+        if isinstance(asset, dict) and isinstance(asset.get("scene_index"), int)
+    }
+    scenes = []
+    for index in range(target_count):
+        asset = visual_assets.get(index, {})
+        scenes.append(
+            {
+                "scene_text": scene_units[index] if index < len(scene_units) else "",
+                "image_prompt": image_prompts[index] if index < len(image_prompts) else "",
+                "asset_path": resolve_workspace_path(str(asset.get("path", "") or "")),
+                "asset_type": str(asset.get("type", "") or ""),
+                "asset_source": str(asset.get("source", "") or ""),
+                "pixabay_query": str(asset.get("pixabay_query", "") or ""),
+                "pixabay_query_type": str(asset.get("pixabay_query_type", "") or ""),
+                "scene_index": index,
+            }
+        )
+
+    merged["metadata"] = dict(merged.get("metadata", {}) or {})
+    merged["subject"] = str(merged.get("subject", "") or "").strip()
+    merged["script"] = script_text or "\n\n".join(scene_units)
+    merged["video_path"] = resolve_workspace_path(str(merged.get("video_path", "") or ""))
+    merged["tts_path"] = resolve_workspace_path(str(merged.get("tts_path", "") or ""))
+    merged["scenes"] = scenes
+    merged["scene_units"] = scene_units[:target_count]
+    merged["image_prompts"] = image_prompts[:target_count]
+    return merged
+
+
+def save_youtube_draft(
+    account_id: str,
+    video_path: str,
+    metadata: dict,
+    workspace_dir: str = "",
+    subject: str = "",
+    script: str = "",
+    scene_units: list[str] | None = None,
+    image_prompts: list[str] | None = None,
+) -> None:
     drafts_payload = load_youtube_drafts()
     drafts = drafts_payload.get("drafts", [])
     normalized_path = os.path.abspath(video_path)
@@ -65,6 +175,8 @@ def save_youtube_draft(account_id: str, video_path: str, metadata: dict) -> None
     pricing_payload = load_pricing_for_video(normalized_path, normalized_metadata)
     if pricing_payload:
         normalized_metadata["pricing"] = pricing_payload
+    normalized_workspace_dir = infer_youtube_workspace_dir(normalized_path, workspace_dir)
+    workspace_payload = load_youtube_run_state(normalized_workspace_dir) if normalized_workspace_dir else None
 
     drafts = [
         draft for draft in drafts
@@ -78,6 +190,23 @@ def save_youtube_draft(account_id: str, video_path: str, metadata: dict) -> None
             "account_id": account_id,
             "video_path": normalized_path,
             "metadata": normalized_metadata,
+            "workspace_dir": normalized_workspace_dir,
+            "subject": str(
+                subject or (workspace_payload.get("subject", "") if workspace_payload else "")
+            ).strip(),
+            "script": str(
+                script or (workspace_payload.get("script", "") if workspace_payload else "")
+            ).strip(),
+            "scene_units": list(
+                scene_units
+                if scene_units is not None
+                else (workspace_payload.get("scene_units", []) if workspace_payload else [])
+            ),
+            "image_prompts": list(
+                image_prompts
+                if image_prompts is not None
+                else (workspace_payload.get("image_prompts", []) if workspace_payload else [])
+            ),
             "created_at": datetime.now().isoformat(timespec="seconds"),
         }
     )
@@ -176,6 +305,7 @@ def format_recoverable_run_option(run_payload: dict) -> str:
 
 
 ANSI_ESCAPE_RE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+MOVIEPY_PROGRESS_RE = re.compile(r"^(?:[\w-]+:\s*)?\d{1,3}%\|")
 
 
 class StreamlitLogCapture(io.TextIOBase):
@@ -194,7 +324,7 @@ class StreamlitLogCapture(io.TextIOBase):
         while "\n" in self.pending:
             line, self.pending = self.pending.split("\n", 1)
             cleaned = line.strip()
-            if cleaned:
+            if cleaned and not MOVIEPY_PROGRESS_RE.match(cleaned):
                 self.lines.append(cleaned)
 
         self.lines = self.lines[-self.max_lines:]
@@ -203,7 +333,7 @@ class StreamlitLogCapture(io.TextIOBase):
 
     def flush(self):
         cleaned = self.pending.strip()
-        if cleaned:
+        if cleaned and not MOVIEPY_PROGRESS_RE.match(cleaned):
             self.lines.append(cleaned)
             self.lines = self.lines[-self.max_lines:]
             self.pending = ""
@@ -223,23 +353,59 @@ class StreamlitLogCapture(io.TextIOBase):
 
 
 def build_youtube_generation_monitor():
-    st.markdown("#### Live Generation")
-    status_placeholder = st.empty()
-    subject_placeholder = st.empty()
-    script_placeholder = st.empty()
-    metadata_placeholder = st.empty()
-    prompts_placeholder = st.empty()
-    assets_placeholder = st.empty()
-    logs_placeholder = st.empty()
+    # ── Progress bar + step label (always visible at top) ───────────
+    progress_caption = st.empty()
+    progress_bar = st.progress(0)
+
+    # ── Two-column layout: left = live feed, right = content preview ─
+    left_col, right_col = st.columns([1.1, 0.9])
+    with left_col:
+        status_placeholder = st.empty()
+        assets_placeholder = st.empty()
+    with right_col:
+        subject_placeholder = st.empty()
+        metadata_summary_placeholder = st.empty()
+        script_placeholder = st.empty()
+
+    # ── Collapsible details ─────────────────────────────────────────
+    with st.expander("Image prompts", expanded=False):
+        prompts_placeholder = st.empty()
+    with st.expander("Technical log", expanded=False):
+        logs_placeholder = st.empty()
+
     log_capture = StreamlitLogCapture(logs_placeholder)
     seen_assets: list[str] = []
+    progress_state = {
+        "value": 0,
+        "expected_assets": 0,
+        "completed_assets": 0,
+    }
 
-    def render_note(title: str, body: str) -> str:
+    def set_progress(value: int, label: str | None = None) -> None:
+        bounded_value = max(0, min(100, int(value)))
+        progress_state["value"] = max(progress_state["value"], bounded_value)
+        progress_bar.progress(progress_state["value"])
+        if label:
+            progress_caption.caption(f"{progress_state['value']}% — {label}")
+
+    def update_assets_progress() -> None:
+        expected = int(progress_state.get("expected_assets", 0) or 0)
+        completed = int(progress_state.get("completed_assets", 0) or 0)
+        if expected <= 0:
+            set_progress(50, "Preparing visual assets...")
+            return
+        ratio = min(1.0, completed / max(expected, 1))
+        set_progress(45 + int(ratio * 25), f"Assets {completed}/{expected}")
+
+    def render_compact_note(title: str, body: str) -> str:
         return (
-            f'<div class="studio-note" style="margin-bottom:0.75rem;">'
-            f"<strong>{escape(title)}</strong><br>"
-            f'<div style="white-space:pre-wrap;">{escape(body)}</div>'
-            f"</div>"
+            f'<div style="padding:0.6rem 0.8rem;border-radius:14px;'
+            f'background:rgba(208,240,215,0.35);border:1px solid rgba(31,122,90,0.08);'
+            f'margin-bottom:0.5rem;font-size:0.88rem;line-height:1.55;">'
+            f'<strong style="font-size:0.76rem;text-transform:uppercase;letter-spacing:0.06em;'
+            f'color:#3a6b55;">{escape(title)}</strong><br>'
+            f'<div style="white-space:pre-wrap;color:#224739;" dir="auto">{escape(body)}</div>'
+            f'</div>'
         )
 
     def progress_callback(event: dict) -> None:
@@ -249,63 +415,93 @@ def build_youtube_generation_monitor():
 
         if message:
             status_placeholder.markdown(
-                render_note("Current Step", message),
+                render_compact_note("Current Step", message),
                 unsafe_allow_html=True,
             )
-            log_capture.append(message)
+            if stage != "render_progress":
+                log_capture.append(message)
+
+        stage_progress = {
+            "topic": 10, "script": 20, "metadata_start": 25, "metadata": 30,
+            "prompts_start": 35, "image_prompts": 40, "assets_start": 45,
+            "tts_start": 78, "tts": 82, "recovery": 84, "combine": 86,
+            "subtitles": 90, "subtitles_start": 88, "render_start": 92,
+            "render": 94, "done": 100,
+        }
+        if stage in stage_progress:
+            set_progress(stage_progress[stage], message or stage.replace("_", " ").title())
 
         if payload.get("subject"):
             subject_placeholder.markdown(
-                render_note("Topic", str(payload.get("subject", "")).strip()),
+                render_compact_note("Topic", str(payload["subject"]).strip()),
                 unsafe_allow_html=True,
             )
 
         if payload.get("script"):
+            script_text = str(payload["script"]).strip()
+            # Show first 200 chars with ellipsis to keep it compact
+            preview = script_text[:200] + ("..." if len(script_text) > 200 else "")
             script_placeholder.markdown(
-                render_note("Script", str(payload.get("script", "")).strip()),
+                render_compact_note("Script", preview),
                 unsafe_allow_html=True,
             )
 
         if payload.get("metadata"):
-            metadata_placeholder.markdown(
-                render_note(
-                    "Metadata",
-                    json.dumps(payload.get("metadata", {}), ensure_ascii=False, indent=2),
-                ),
+            meta = payload["metadata"]
+            title_str = str(meta.get("title", "")).strip()
+            desc_str = str(meta.get("description", "")).strip()[:120]
+            tags = meta.get("hashtags", [])[:5]
+            summary = f"{title_str}\n{desc_str}"
+            if tags:
+                summary += "\n" + " ".join(str(t) for t in tags)
+            metadata_summary_placeholder.markdown(
+                render_compact_note("Metadata", summary),
                 unsafe_allow_html=True,
             )
 
         if payload.get("image_prompts"):
+            progress_state["expected_assets"] = len(payload["image_prompts"])
+            progress_state["completed_assets"] = 0
             prompts_text = "\n".join(
-                f"{index + 1}. {prompt}"
-                for index, prompt in enumerate(payload.get("image_prompts", []))
+                f"{i + 1}. {p[:90]}{'...' if len(p) > 90 else ''}"
+                for i, p in enumerate(payload["image_prompts"])
             )
             prompts_placeholder.markdown(
-                render_note("Image Prompts", prompts_text),
+                render_compact_note(f"Image Prompts ({len(payload['image_prompts'])})", prompts_text),
                 unsafe_allow_html=True,
             )
 
         if stage == "visual_asset":
+            progress_state["completed_assets"] = int(progress_state.get("completed_assets", 0) or 0) + 1
+            update_assets_progress()
             scene_index = payload.get("scene_index")
-            scene_label = f"Scene {int(scene_index) + 1}" if isinstance(scene_index, int) else "Scene"
-            asset_line = (
-                f"{scene_label}: {payload.get('source', 'Asset')} "
-                f"{payload.get('asset_type', 'asset')} saved"
+            scene_label = f"S{int(scene_index) + 1}" if isinstance(scene_index, int) else "?"
+            source = str(payload.get("source", "")).strip()
+            atype = str(payload.get("asset_type", "")).strip()
+            seen_assets.append(f"{scene_label}: {source} {atype}")
+            # Show as compact inline chips
+            chips = " ".join(
+                f'<span style="display:inline-block;padding:0.2rem 0.55rem;border-radius:999px;'
+                f'background:rgba(31,122,90,0.08);border:1px solid rgba(31,122,90,0.1);'
+                f'font-size:0.78rem;margin:2px;">{escape(a)}</span>'
+                for a in seen_assets[-20:]
             )
-            seen_assets.append(asset_line)
             assets_placeholder.markdown(
-                render_note("Visual Assets", "\n".join(seen_assets[-16:])),
+                f'<div style="padding:0.6rem 0.8rem;border-radius:14px;'
+                f'background:rgba(208,240,215,0.35);border:1px solid rgba(31,122,90,0.08);'
+                f'margin-bottom:0.5rem;">'
+                f'<strong style="font-size:0.76rem;text-transform:uppercase;letter-spacing:0.06em;'
+                f'color:#3a6b55;">Assets ({len(seen_assets)})</strong><br>'
+                f'<div style="margin-top:0.3rem;">{chips}</div></div>',
                 unsafe_allow_html=True,
             )
 
+        if stage == "render_progress":
+            render_ratio = max(0.0, min(1.0, float(payload.get("progress", 0.0) or 0.0)))
+            set_progress(95 + int(render_ratio * 5), message or "Rendering final video...")
+
         if stage == "done" and payload.get("video_path"):
-            assets_placeholder.markdown(
-                render_note(
-                    "Final Output",
-                    f'Video written to:\n{payload.get("video_path", "")}',
-                ),
-                unsafe_allow_html=True,
-            )
+            set_progress(100, "Done!")
 
     return progress_callback, log_capture
 
@@ -342,6 +538,8 @@ def inject_app_styles() -> None:
             max-width: 1380px;
             padding-top: 1rem;
             padding-bottom: 4rem;
+            padding-left: 2rem;
+            padding-right: 2rem;
         }
         [data-testid="stForm"] {
             border: 1px solid var(--studio-border);
@@ -723,6 +921,501 @@ def format_draft_option(draft: dict) -> str:
     created_at = str(draft.get("created_at", "")).replace("T", " ")
     basename = os.path.basename(str(draft.get("video_path", "")))
     return f"{created_at} | {title} | {basename}"
+
+
+def sync_scene_rows_from_script(script_text: str, existing_scenes: list[dict] | None = None) -> list[dict]:
+    units = [
+        part.strip(" \t\r\n-")
+        for part in re.split(r"(?<=[\.\!\?\u061f])\s+|\n+", str(script_text or "").strip())
+        if part and part.strip()
+    ]
+    if not units:
+        units = [""] if str(script_text or "").strip() else []
+
+    existing = list(existing_scenes or [])
+    rows = []
+    for index, unit in enumerate(units):
+        previous = existing[index] if index < len(existing) and isinstance(existing[index], dict) else {}
+        rows.append(
+            {
+                "scene_text": unit,
+                "image_prompt": str(previous.get("image_prompt", "") or unit).strip(),
+                "asset_path": str(previous.get("asset_path", "") or ""),
+                "asset_type": str(previous.get("asset_type", "") or ""),
+                "asset_source": str(previous.get("asset_source", "") or ""),
+                "pixabay_query": str(previous.get("pixabay_query", "") or ""),
+                "pixabay_query_type": str(previous.get("pixabay_query_type", "") or ""),
+                "scene_index": index,
+            }
+        )
+    return rows
+
+
+def sync_script_from_scene_rows(scene_rows: list[dict]) -> str:
+    return "\n\n".join(
+        str(scene.get("scene_text", "") or "").strip()
+        for scene in list(scene_rows or [])
+        if str(scene.get("scene_text", "") or "").strip()
+    )
+
+
+def build_youtube_editor_signature(payload: dict) -> str:
+    signature_payload = {
+        "workspace_dir": payload.get("workspace_dir", ""),
+        "video_path": payload.get("video_path", ""),
+        "updated_at": payload.get("updated_at", ""),
+        "subject": payload.get("subject", ""),
+        "script": payload.get("script", ""),
+        "scene_count": len(payload.get("scenes", []) or []),
+    }
+    return json.dumps(signature_payload, ensure_ascii=False, sort_keys=True)
+
+
+def ensure_youtube_editor_state(editor_key: str, source_payload: dict) -> dict:
+    normalized = build_youtube_editor_payload(source_payload)
+    signature = build_youtube_editor_signature(normalized)
+    current = st.session_state.get(editor_key)
+    if not isinstance(current, dict) or current.get("_source_signature") != signature:
+        st.session_state[editor_key] = {
+            "_source_signature": signature,
+            "workspace_dir": normalized.get("workspace_dir", ""),
+            "video_path": normalized.get("video_path", ""),
+            "tts_path": normalized.get("tts_path", ""),
+            "subject": normalized.get("subject", ""),
+            "script": normalized.get("script", ""),
+            "metadata": dict(normalized.get("metadata", {}) or {}),
+            "scenes": [
+                {
+                    "scene_text": str(scene.get("scene_text", "") or ""),
+                    "image_prompt": str(scene.get("image_prompt", "") or ""),
+                    "asset_path": str(scene.get("asset_path", "") or ""),
+                    "asset_type": str(scene.get("asset_type", "") or ""),
+                    "asset_source": str(scene.get("asset_source", "") or ""),
+                    "pixabay_query": str(scene.get("pixabay_query", "") or ""),
+                    "pixabay_query_type": str(scene.get("pixabay_query_type", "") or ""),
+                    "scene_index": int(scene.get("scene_index", index) or index),
+                }
+                for index, scene in enumerate(normalized.get("scenes", []) or [])
+                if isinstance(scene, dict)
+            ],
+        }
+    return st.session_state[editor_key]
+
+
+def editor_state_to_payload(editor_state: dict) -> dict:
+    scenes = [
+        scene for scene in list(editor_state.get("scenes", []) or [])
+        if isinstance(scene, dict)
+    ]
+    scene_units = [
+        str(scene.get("scene_text", "") or "").strip()
+        for scene in scenes
+        if str(scene.get("scene_text", "") or "").strip()
+    ]
+    image_prompts = [
+        str(scene.get("image_prompt", "") or "").strip()
+        for scene in scenes
+        if str(scene.get("scene_text", "") or "").strip() or str(scene.get("image_prompt", "") or "").strip()
+    ]
+    if len(image_prompts) < len(scene_units):
+        fallback_prompt = image_prompts[-1] if image_prompts else (scene_units[-1] if scene_units else "")
+        image_prompts.extend([fallback_prompt] * (len(scene_units) - len(image_prompts)))
+    return {
+        "workspace_dir": str(editor_state.get("workspace_dir", "") or "").strip(),
+        "video_path": str(editor_state.get("video_path", "") or "").strip(),
+        "tts_path": str(editor_state.get("tts_path", "") or "").strip(),
+        "subject": str(editor_state.get("subject", "") or "").strip(),
+        "script": str(editor_state.get("script", "") or "").strip(),
+        "metadata": dict(editor_state.get("metadata", {}) or {}),
+        "scene_units": scene_units,
+        "image_prompts": image_prompts[:len(scene_units)],
+        "scenes": scenes,
+    }
+
+
+def persist_youtube_editor_result(account_id: str, youtube: YouTube) -> None:
+    preview_state = {
+        "account_id": account_id,
+        "subject": getattr(youtube, "subject", ""),
+        "script": getattr(youtube, "script", ""),
+        "metadata": youtube.metadata,
+        "scene_units": list(getattr(youtube, "scene_units", []) or []),
+        "image_prompts": list(getattr(youtube, "image_prompts", []) or []),
+        "workspace_dir": getattr(youtube, "_workspace_dir", ""),
+        "video_path": getattr(youtube, "video_path", ""),
+    }
+    st.session_state["youtube_preview"] = preview_state
+
+    if getattr(youtube, "video_path", ""):
+        st.session_state["youtube_generated_video"] = {
+            **preview_state,
+            "video_path": youtube.video_path,
+        }
+        save_youtube_draft(
+            account_id,
+            youtube.video_path,
+            youtube.metadata,
+            workspace_dir=getattr(youtube, "_workspace_dir", ""),
+            subject=getattr(youtube, "subject", ""),
+            script=getattr(youtube, "script", ""),
+            scene_units=list(getattr(youtube, "scene_units", []) or []),
+            image_prompts=list(getattr(youtube, "image_prompts", []) or []),
+        )
+
+
+def render_youtube_scene_editor(
+    *,
+    editor_key: str,
+    source_payload: dict,
+    title: str,
+    body: str,
+    show_video: bool = True,
+    allow_generate_from_editor: bool = False,
+) -> tuple[dict, dict | None]:
+    editor_state = ensure_youtube_editor_state(editor_key, source_payload)
+
+    video_path = str(editor_state.get("video_path", "") or "").strip()
+    workspace_dir = str(editor_state.get("workspace_dir", "") or "").strip()
+    has_workspace = bool(workspace_dir and os.path.exists(os.path.join(workspace_dir, "run_state.json")))
+
+    # ── Top action bar ──────────────────────────────────────────────────
+    if has_workspace:
+        btn_cols = st.columns([0.8, 1.2, 1.2, 1])
+        action_save = btn_cols[0].button("Save", width="stretch", key=f"{editor_key}_save", type="primary")
+        action_regen_voice = btn_cols[1].button("Regen Voice + Video", width="stretch", key=f"{editor_key}_voice")
+        action_regen_scenes = btn_cols[2].button("Regen Scenes + Video", width="stretch", key=f"{editor_key}_scenes")
+        if allow_generate_from_editor:
+            action_generate = btn_cols[3].button("Generate Full Video", width="stretch", key=f"{editor_key}_generate")
+        else:
+            action_generate = False
+    else:
+        btn_cols = st.columns([1, 1])
+        action_save = btn_cols[0].button("Save", width="stretch", key=f"{editor_key}_save", type="primary")
+        if allow_generate_from_editor:
+            action_generate = btn_cols[1].button("Generate Full Video", width="stretch", key=f"{editor_key}_generate")
+        else:
+            action_generate = False
+        action_regen_voice = False
+        action_regen_scenes = False
+
+    # ── Video preview + metadata side by side ───────────────────────────
+    video_col, meta_col = st.columns([0.38, 0.62])
+    with video_col:
+        if show_video and video_path and os.path.exists(video_path):
+            st.video(video_path)
+        elif show_video and workspace_dir:
+            st.caption(f"Workspace: {workspace_dir}")
+
+    with meta_col:
+        subject_value = st.text_input(
+            "Topic",
+            value=editor_state.get("subject", ""),
+            key=f"{editor_key}_subject",
+        )
+        metadata = dict(editor_state.get("metadata", {}) or {})
+        title_col, desc_col = st.columns([1, 1])
+        with title_col:
+            metadata["title"] = st.text_input(
+                "Title",
+                value=metadata.get("title", ""),
+                key=f"{editor_key}_title",
+            )
+        with desc_col:
+            metadata["description"] = st.text_area(
+                "Description",
+                value=metadata.get("description", ""),
+                height=80,
+                key=f"{editor_key}_description",
+            )
+        script_value = st.text_area(
+            "Transcript",
+            value=editor_state.get("script", ""),
+            height=160,
+            key=f"{editor_key}_script",
+        )
+
+    editor_state["subject"] = subject_value
+    editor_state["script"] = script_value
+    editor_state["metadata"] = metadata
+
+    # ── Scene sync actions ──────────────────────────────────────────────
+    scene_action_cols = st.columns([1, 1, 0.7])
+    if scene_action_cols[0].button("Sync Scenes From Transcript", width="stretch", key=f"{editor_key}_sync_scenes"):
+        editor_state["scenes"] = sync_scene_rows_from_script(editor_state.get("script", ""), editor_state.get("scenes", []))
+        st.session_state[editor_key] = editor_state
+        st.rerun()
+    if scene_action_cols[1].button("Sync Transcript From Scenes", width="stretch", key=f"{editor_key}_sync_script"):
+        editor_state["script"] = sync_script_from_scene_rows(editor_state.get("scenes", []))
+        st.session_state[editor_key] = editor_state
+        st.rerun()
+    if scene_action_cols[2].button("Add Scene", width="stretch", key=f"{editor_key}_add_scene"):
+        next_index = len(editor_state.get("scenes", []))
+        editor_state.setdefault("scenes", []).append(
+            {
+                "scene_text": "",
+                "image_prompt": "",
+                "asset_path": "",
+                "asset_type": "",
+                "asset_source": "",
+                "scene_index": next_index,
+            }
+        )
+        st.session_state[editor_key] = editor_state
+        st.rerun()
+
+    # ── Scene navigator (single scene at a time) ───────────────────────
+    scenes = list(editor_state.get("scenes", []) or [])
+    if not scenes:
+        st.info("No scene rows yet. Click **Sync Scenes From Transcript** to create them.")
+    else:
+        scene_nav_key = f"{editor_key}_scene_nav"
+        current_scene_idx = st.session_state.get(scene_nav_key, 0)
+        if current_scene_idx >= len(scenes):
+            current_scene_idx = 0
+
+        # Navigator: prev / selector / next
+        nav_prev, nav_select, nav_next = st.columns([0.3, 1.4, 0.3])
+        with nav_prev:
+            if st.button("< Prev", width="stretch", key=f"{editor_key}_prev", disabled=current_scene_idx == 0):
+                st.session_state[scene_nav_key] = max(0, current_scene_idx - 1)
+                st.rerun()
+        with nav_select:
+            scene_options = [
+                f"Scene {i + 1}/{len(scenes)} — {(s.get('asset_source') or 'No asset')} {(s.get('asset_type') or '')}"
+                for i, s in enumerate(scenes)
+            ]
+            selected_scene_label = st.selectbox(
+                "Scene",
+                options=scene_options,
+                index=current_scene_idx,
+                key=f"{editor_key}_scene_select",
+                label_visibility="collapsed",
+            )
+            new_idx = scene_options.index(selected_scene_label) if selected_scene_label in scene_options else current_scene_idx
+            if new_idx != current_scene_idx:
+                st.session_state[scene_nav_key] = new_idx
+                st.rerun()
+            current_scene_idx = new_idx
+        with nav_next:
+            if st.button("Next >", width="stretch", key=f"{editor_key}_next", disabled=current_scene_idx >= len(scenes) - 1):
+                st.session_state[scene_nav_key] = min(len(scenes) - 1, current_scene_idx + 1)
+                st.rerun()
+
+        # ── Current scene editor ────────────────────────────────────────
+        index = current_scene_idx
+        scene = scenes[index]
+        asset_path = str(scene.get("asset_path", "") or "").strip()
+        asset_ext = os.path.splitext(asset_path)[1].lower()
+        image_extensions = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
+        video_extensions = {".mp4", ".mov", ".m4v", ".webm", ".avi", ".mkv"}
+
+        scene_media_col, scene_edit_col = st.columns([0.38, 0.62])
+        with scene_media_col:
+            if asset_path and os.path.exists(asset_path):
+                if asset_ext in image_extensions:
+                    st.image(asset_path, use_container_width=True)
+                elif asset_ext in video_extensions:
+                    st.video(asset_path)
+                source_label = scene.get("asset_source", "Saved")
+                type_label = scene.get("asset_type", "asset")
+                st.caption(f"{source_label} {type_label}")
+            elif asset_path:
+                st.caption(f"Asset not found: {os.path.basename(asset_path)}")
+            else:
+                st.markdown(
+                    '<div style="padding:2rem 1rem;text-align:center;color:#9ab0a4;border:2px dashed #cde0d5;border-radius:16px;">'
+                    'No asset</div>',
+                    unsafe_allow_html=True,
+                )
+
+        with scene_edit_col:
+            transcript_value = st.text_area(
+                "Scene transcript",
+                value=str(scene.get("scene_text", "") or ""),
+                height=100,
+                key=f"{editor_key}_scene_text_{index}",
+            )
+            prompt_value = st.text_area(
+                "Visual prompt",
+                value=str(scene.get("image_prompt", "") or ""),
+                height=90,
+                key=f"{editor_key}_scene_prompt_{index}",
+            )
+            scene["scene_text"] = transcript_value
+            scene["image_prompt"] = prompt_value
+            scene["scene_index"] = index
+            editor_state["scenes"][index] = scene
+
+            # Scene actions row
+            regen_col, dup_col, rm_col, clear_col = st.columns(4)
+            if has_workspace:
+                regen_provider = regen_col.selectbox(
+                    "Regen with",
+                    options=["Pixabay", "Nano Banana"],
+                    index=0 if str(scene.get("asset_source", "")).strip().lower() == "pixabay" else 1,
+                    key=f"{editor_key}_regen_provider_{index}",
+                    label_visibility="collapsed",
+                )
+            if dup_col.button("Duplicate", width="stretch", key=f"{editor_key}_duplicate_{index}"):
+                duplicated = dict(scene)
+                duplicated["asset_path"] = ""
+                duplicated["asset_source"] = ""
+                duplicated["asset_type"] = ""
+                editor_state["scenes"].insert(index + 1, duplicated)
+                st.session_state[editor_key] = editor_state
+                st.rerun()
+            if rm_col.button("Remove", width="stretch", key=f"{editor_key}_remove_{index}") and len(scenes) > 1:
+                editor_state["scenes"].pop(index)
+                st.session_state[editor_key] = editor_state
+                st.session_state[scene_nav_key] = min(index, len(editor_state["scenes"]) - 1)
+                st.rerun()
+            if clear_col.button("Clear Asset", width="stretch", key=f"{editor_key}_clear_asset_{index}"):
+                editor_state["scenes"][index]["asset_path"] = ""
+                editor_state["scenes"][index]["asset_source"] = ""
+                editor_state["scenes"][index]["asset_type"] = ""
+                st.session_state[editor_key] = editor_state
+                st.rerun()
+
+            if has_workspace:
+                if regen_col.button("Regen Asset", width="stretch", key=f"{editor_key}_regen_asset_{index}"):
+                    st.session_state[editor_key] = editor_state
+                    provider_value = "pixabay" if regen_provider == "Pixabay" else "nanobanana2"
+                    return editor_state_to_payload(editor_state), {
+                        "type": "regenerate_scene_asset",
+                        "scene_index": index,
+                        "provider": provider_value,
+                    }
+
+    # ── Resolve action ──────────────────────────────────────────────────
+    st.session_state[editor_key] = editor_state
+    payload = editor_state_to_payload(editor_state)
+
+    action: dict | None = None
+    if action_save:
+        action = {"type": "save"}
+    elif action_generate:
+        action = {"type": "generate_from_editor"}
+    elif action_regen_voice:
+        action = {"type": "regenerate_voiceover"}
+    elif action_regen_scenes:
+        action = {"type": "regenerate_scenes"}
+
+    return payload, action
+
+
+@st.dialog("Choose Pixabay Asset")
+def render_youtube_pixabay_picker_dialog(
+    account: dict,
+    niche_override: str,
+    language_override: str,
+    dialect_override: str,
+    context_override: str,
+) -> None:
+    picker_state = st.session_state.get(YOUTUBE_PIXABAY_PICKER_STATE_KEY, {})
+    if not isinstance(picker_state, dict) or picker_state.get("account_id") != account["id"]:
+        return
+
+    scene_index = int(picker_state.get("scene_index", 0) or 0)
+    candidates = list(picker_state.get("candidates", []) or [])
+    editor_payload = dict(picker_state.get("editor_payload", {}) or {})
+    editor_key = str(picker_state.get("editor_key", "") or "")
+    query_source = str(picker_state.get("pixabay_query_source", "heuristic") or "heuristic").strip()
+    search_mode = str(picker_state.get("search_mode", "primary") or "primary").strip()
+    query_generation_note = str(picker_state.get("query_generation_note", "") or "").strip()
+    query_variants = list(picker_state.get("query_variants", []) or [])
+
+    st.caption(f"Scene {scene_index + 1}")
+    st.write(str(picker_state.get("scene_text", "") or ""))
+    st.text_area(
+        "Prompt",
+        value=str(picker_state.get("prompt_text", "") or ""),
+        height=90,
+        disabled=True,
+        key=f"pixabay_picker_prompt_{account['id']}_{scene_index}",
+    )
+    st.caption(f"Query source: {query_source} | Search mode: {search_mode}")
+    if query_generation_note:
+        st.caption(query_generation_note)
+    if query_variants:
+        st.caption(
+            "Tried q values: "
+            + " | ".join(
+                str(variant.get("query", "") or "").strip()
+                for variant in query_variants[:5]
+                if isinstance(variant, dict) and str(variant.get("query", "") or "").strip()
+            )
+        )
+
+    if not candidates:
+        st.info("No Pixabay candidates passed the quality threshold for this scene.")
+        if st.button("Close", width="stretch", key=f"pixabay_picker_close_{account['id']}_{scene_index}"):
+            st.session_state.pop(YOUTUBE_PIXABAY_PICKER_STATE_KEY, None)
+            st.rerun()
+    else:
+        selected_index = st.radio(
+            "Pick one fetched Pixabay asset",
+            options=list(range(len(candidates))),
+            format_func=lambda idx: (
+                f"Option {idx + 1} | {candidates[idx].get('asset_type', 'asset')} | "
+                f"score {float(candidates[idx].get('selection_score', 0.0) or 0.0):.1f}"
+            ),
+            key=f"pixabay_picker_choice_{account['id']}_{scene_index}",
+        )
+        selected_candidate = candidates[selected_index]
+        preview_url = str(selected_candidate.get("preview_url", "") or "")
+        if preview_url:
+            if str(selected_candidate.get("asset_type", "")).lower() == "video":
+                media_col, _ = st.columns([0.35, 0.65])
+                media_col.video(preview_url)
+            else:
+                media_col, _ = st.columns([0.35, 0.65])
+                media_col.image(preview_url, width="stretch")
+        st.caption(
+            f"Query: {selected_candidate.get('best_query', '')} | "
+            f"Tags: {', '.join(selected_candidate.get('top_tags', []))}"
+        )
+
+        apply_col, cancel_col = st.columns([1, 1])
+        if apply_col.button("Use This Asset", width="stretch", key=f"pixabay_picker_apply_{account['id']}_{scene_index}"):
+            try:
+                youtube = YouTube(
+                    account["id"],
+                    account["nickname"],
+                    account["firefox_profile"],
+                    niche_override,
+                    language_override,
+                    dialect_override,
+                    context_override,
+                    account.get("is_for_kids"),
+                    open_browser=False,
+                )
+                with st.spinner("Applying selected Pixabay asset..."):
+                    youtube.apply_workspace_edits(
+                        editor_payload.get("workspace_dir", ""),
+                        subject=editor_payload.get("subject", ""),
+                        script=editor_payload.get("script", ""),
+                        metadata=editor_payload.get("metadata", {}),
+                        scene_units=editor_payload.get("scene_units", []),
+                        image_prompts=editor_payload.get("image_prompts", []),
+                    )
+                    youtube.replace_scene_asset_with_pixabay_candidate(
+                        scene_index,
+                        selected_candidate,
+                        editor_payload.get("workspace_dir", ""),
+                    )
+                persist_youtube_editor_result(account["id"], youtube)
+                if editor_key:
+                    st.session_state.pop(editor_key, None)
+                st.session_state.pop(YOUTUBE_PIXABAY_PICKER_STATE_KEY, None)
+                st.rerun()
+            except Exception as exc:
+                st.error(str(exc))
+                with st.expander("Technical details", expanded=False):
+                    st.code(traceback.format_exc())
+
+        if cancel_col.button("Cancel", width="stretch", key=f"pixabay_picker_cancel_{account['id']}_{scene_index}"):
+            st.session_state.pop(YOUTUBE_PIXABAY_PICKER_STATE_KEY, None)
+            st.rerun()
 
 
 def load_pricing_for_video(video_path: str, metadata: dict | None = None) -> dict:
@@ -1136,6 +1829,17 @@ def render_config_tab() -> None:
                     "OpenAI TTS voice",
                     value=config.get("openai_tts_voice", "onyx"),
                 )
+                stt_options = ["local_whisper", "script_based", "third_party_assemblyai"]
+                current_stt = config.get("stt_provider", "local_whisper")
+                if current_stt not in stt_options:
+                    current_stt = "local_whisper"
+                config["stt_provider"] = st.selectbox(
+                    "Subtitle provider (STT)",
+                    options=stt_options,
+                    index=stt_options.index(current_stt),
+                    format_func=lambda s: {"local_whisper": "Local Whisper (GPU, accurate sync)", "script_based": "Script-based (fast, less accurate)", "third_party_assemblyai": "AssemblyAI (cloud, paid)"}.get(s, s),
+                    help="Local Whisper uses your GPU for accurate subtitle timing. Script-based estimates from text.",
+                )
                 subtitle_mode_options = ["word_by_word", "chunk"]
                 current_subtitle_mode = config.get("subtitle_mode", "word_by_word")
                 if current_subtitle_mode not in subtitle_mode_options:
@@ -1223,6 +1927,59 @@ def render_config_tab() -> None:
                     "Legacy subtitle font file",
                     value=config.get("subtitle_font", config.get("font", "bold_font.ttf")),
                     help="Fallback font file kept for backward compatibility.",
+                )
+
+                st.markdown("---")
+                render_panel("Video Quality", "Frame rate, transitions, and sound effects that shape the final output.", soft=True)
+                config["video_fps"] = int(
+                    st.selectbox(
+                        "Video FPS",
+                        options=[24, 30, 60],
+                        index=[24, 30, 60].index(
+                            config.get("video_fps", 30)
+                            if config.get("video_fps", 30) in [24, 30, 60]
+                            else 30
+                        ),
+                        help="30 is standard. 60 gives smoother playback, especially on TikTok.",
+                    )
+                )
+                config["crossfade_duration"] = as_float(
+                    st.number_input(
+                        "Crossfade duration (seconds)",
+                        min_value=0.0,
+                        max_value=1.0,
+                        step=0.05,
+                        value=as_float(config.get("crossfade_duration", 0.3), 0.3),
+                        help="Fade transition between scenes. 0 = hard cut.",
+                    ),
+                    0.3,
+                )
+                config["sound_effects_enabled"] = st.checkbox(
+                    "Enable sound effects",
+                    value=config.get("sound_effects_enabled", False),
+                    help="Add sound effects triggered by specific words in the voiceover.",
+                )
+                config["sound_effects_volume"] = as_float(
+                    st.number_input(
+                        "Sound effects volume",
+                        min_value=0.0,
+                        max_value=1.0,
+                        step=0.05,
+                        value=as_float(config.get("sound_effects_volume", 0.45), 0.45),
+                        help="How loud sound effects are relative to the voiceover (0-1).",
+                    ),
+                    0.45,
+                )
+                config["sound_effects_offset"] = as_float(
+                    st.number_input(
+                        "Sound effects timing offset (seconds)",
+                        min_value=-1.0,
+                        max_value=1.0,
+                        step=0.05,
+                        value=as_float(config.get("sound_effects_offset", -0.15), -0.15),
+                        help="Negative = SFX plays before the trigger word (anticipation). Positive = after.",
+                    ),
+                    -0.15,
                 )
 
         with pricing_tab:
@@ -1669,38 +2426,39 @@ def render_account_editor(provider: str) -> None:
 
 
 def render_twitter_studio() -> None:
-    render_section_intro(
-        "Twitter Studio",
-        "Generate a single post, refine it if needed, and publish only when the tone feels right for that account.",
-        eyebrow="Publishing",
-    )
     accounts = get_accounts("twitter")
     if not accounts:
-        st.info("Create a Twitter account first.")
+        st.info("Create a Twitter account first in the Accounts page.")
         return
 
-    account_id = st.selectbox(
-        "Twitter account",
-        options=[account["id"] for account in accounts],
-        format_func=lambda selected_id: next(
-            f'{account["nickname"]} - {account.get("topic", "")}'
-            for account in accounts
-            if account["id"] == selected_id
-        ),
-    )
+    sel_col, stat_col = st.columns([3, 0.5])
+    with sel_col:
+        account_id = st.selectbox(
+            "Twitter account",
+            options=[account["id"] for account in accounts],
+            format_func=lambda selected_id: next(
+                f'{account["nickname"]} — {account.get("topic", "")}'
+                for account in accounts
+                if account["id"] == selected_id
+            ),
+        )
     account = next(account for account in accounts if account["id"] == account_id)
+    with stat_col:
+        st.metric("Posts", len(account.get("posts", [])))
 
-    topic_override = st.text_input("Topic override", value=account.get("topic", ""))
-    context_override = st.text_area(
-        "Character context override",
-        value=account.get("character_context", ""),
-    )
+    with st.expander("Overrides", expanded=False):
+        topic_override = st.text_input("Topic", value=account.get("topic", ""))
+        context_override = st.text_area(
+            "Character context",
+            value=account.get("character_context", ""),
+            height=100,
+        )
 
     render_kv_card(
         "Active Account",
         account.get("nickname", "Twitter account"),
         [
-            ("Topic", topic_override or "Not set"),
+            ("Topic", (topic_override if topic_override != account.get("topic", "") else account.get("topic", "")) or "Not set"),
             ("Language", str(load_config().get("twitter_language", "English"))),
             ("Dialect", str(load_config().get("twitter_dialect", "") or "Default")),
             ("Cached posts", str(len(account.get("posts", [])))),
@@ -1762,25 +2520,23 @@ def render_twitter_studio() -> None:
 
 
 def render_youtube_studio() -> None:
-    render_section_intro(
-        "YouTube Studio",
-        "Preview topics and scripts, generate full vertical videos, and manage a reusable draft library before upload.",
-        eyebrow="Video Workflow",
-    )
     accounts = get_accounts("youtube")
     if not accounts:
-        st.info("Create a YouTube account first.")
+        st.info("Create a YouTube account first in the Accounts page.")
         return
 
-    account_id = st.selectbox(
-        "YouTube account",
-        options=[account["id"] for account in accounts],
-        format_func=lambda selected_id: next(
-            f'{account["nickname"]} - {account.get("niche", "")}'
-            for account in accounts
-            if account["id"] == selected_id
-        ),
-    )
+    # Compact header: account selector + key stats in one row
+    sel_col, stat1, stat2, stat3 = st.columns([2.5, 0.5, 0.5, 0.5])
+    with sel_col:
+        account_id = st.selectbox(
+            "YouTube account",
+            options=[account["id"] for account in accounts],
+            format_func=lambda selected_id: next(
+                f'{account["nickname"]} — {account.get("niche", "")} ({account.get("language", "")})'
+                for account in accounts
+                if account["id"] == selected_id
+            ),
+        )
     account = next(account for account in accounts if account["id"] == account_id)
 
     drafts = get_youtube_drafts_for_account(account["id"])
@@ -1795,45 +2551,39 @@ def render_youtube_studio() -> None:
                     "account_id": account["id"],
                     "video_path": generated_path,
                     "metadata": generated.get("metadata", {}),
+                    "workspace_dir": generated.get("workspace_dir", ""),
+                    "subject": generated.get("subject", ""),
+                    "script": generated.get("script", ""),
+                    "scene_units": list(generated.get("scene_units", []) or []),
+                    "image_prompts": list(generated.get("image_prompts", []) or []),
                     "created_at": "Current session",
                 }
             ] + drafts
 
-    workspace_col, status_col = st.columns([1.35, 1])
-    with workspace_col:
-        render_panel(
-            "Creation Workspace",
-            "Use Create for the current run, Preview for quality control, and Draft Library for uploads and reuse. This keeps the page shorter and the next action easier to find.",
-            soft=True,
-        )
-    with status_col:
-        render_kv_card(
-            "Channel Workspace",
-            account.get("nickname", "YouTube account"),
-            [
-                ("Niche", str(account.get("niche", "") or "Not set")),
-                ("Language", str(account.get("language", "English"))),
-                ("Dialect", str(account.get("dialect", "") or "Default")),
-                ("Made for kids", "Yes" if account.get("is_for_kids", get_is_for_kids()) else "No"),
-                ("Drafts", str(len(drafts))),
-                ("Recoverable runs", str(len(recoverable_runs))),
-            ],
-        )
+    with stat1:
+        st.metric("Drafts", len(drafts))
+    with stat2:
+        st.metric("Videos", len(account.get("videos", [])))
+    with stat3:
+        st.metric("Recovery", len(recoverable_runs))
 
     create_tab, preview_tab, drafts_tab, pricing_tab = st.tabs(["Create", "Preview", "Draft Library", "Pricing"])
 
     with create_tab:
-        setup_col, context_col = st.columns([1.2, 1])
-        with setup_col:
-            niche_override = st.text_input("Niche override", value=account.get("niche", ""))
-            language_override = st.text_input("Language override", value=account.get("language", "English"))
-            dialect_override = st.text_input("Dialect override", value=account.get("dialect", ""))
-        with context_col:
-            context_override = st.text_area(
-                "Character context override",
-                value=account.get("character_context", ""),
-                height=180,
-            )
+        # Overrides in a compact expander — most users use defaults
+        with st.expander("Channel overrides", expanded=False):
+            setup_col, context_col = st.columns([1, 1.2])
+            with setup_col:
+                niche_override = st.text_input("Niche", value=account.get("niche", ""), key="yt_niche")
+                language_override = st.text_input("Language", value=account.get("language", "English"), key="yt_lang")
+                dialect_override = st.text_input("Dialect", value=account.get("dialect", ""), key="yt_dialect")
+            with context_col:
+                context_override = st.text_area(
+                    "Character context",
+                    value=account.get("character_context", ""),
+                    height=140,
+                    key="yt_ctx",
+                )
 
         script_mode = st.radio(
             "Script source",
@@ -1844,39 +2594,21 @@ def render_youtube_studio() -> None:
         manual_subject = ""
         manual_script = ""
         if script_mode == "Write manually":
-            st.markdown(
-                """
-                <div class="studio-note">
-                    Manual script mode is on. Paste your final narration below and the app will generate the title,
-                    description, image prompts, images, TTS, subtitles, and final video around your script.
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
             manual_subject = st.text_input(
-                "Manual topic / angle (optional)",
+                "Topic / angle (optional)",
                 key=f"youtube_manual_subject_{account['id']}",
-                help="If you leave this empty, the app will derive a subject from the script itself.",
+                help="If empty, derived from the script.",
             )
             manual_script = st.text_area(
-                "Manual video script",
+                "Video script",
                 key=f"youtube_manual_script_{account['id']}",
-                height=220,
-                help="Paste the exact narration you want. The app will generate metadata, images, TTS, and the final video around it.",
-            )
-        else:
-            st.markdown(
-                """
-                <div class="studio-note">
-                    AI script mode is on. Generate a preview first when you want a quick quality check, then create the full video only when the direction feels right.
-                </div>
-                """,
-                unsafe_allow_html=True,
+                height=200,
+                help="Paste narration. The app generates metadata, images, TTS, and the final video around it.",
             )
 
-        col1, col2, col3 = st.columns(3)
+        col1, col2, col3 = st.columns([1, 1.5, 1])
 
-        if col1.button("Generate Idea + Script Preview", width="stretch"):
+        if col1.button("Preview Idea", width="stretch"):
             try:
                 provider, model = ensure_llm_selected()
                 youtube = YouTube(
@@ -1900,18 +2632,22 @@ def render_youtube_studio() -> None:
                     subject = youtube.generate_topic()
                     script = youtube.generate_script()
                 metadata = youtube.generate_metadata()
+                image_prompts = youtube.generate_prompts()
                 st.session_state["youtube_preview"] = {
                     "account_id": account["id"],
                     "subject": subject,
                     "script": script,
                     "metadata": metadata,
+                    "scene_units": list(getattr(youtube, "scene_units", []) or []),
+                    "image_prompts": image_prompts,
+                    "workspace_dir": getattr(youtube, "_workspace_dir", ""),
                 }
                 st.success(f"Preview generated with {provider}:{model}")
             except Exception as exc:
                 st.error(str(exc))
                 st.code(traceback.format_exc())
 
-        if col2.button("Generate Full Video", width="stretch"):
+        if col2.button("Generate Full Video", width="stretch", type="primary"):
             youtube = None
             try:
                 provider, model = ensure_llm_selected()
@@ -1942,6 +2678,10 @@ def render_youtube_studio() -> None:
                     "subject": getattr(youtube, "subject", ""),
                     "script": getattr(youtube, "script", ""),
                     "metadata": youtube.metadata,
+                    "scene_units": list(getattr(youtube, "scene_units", []) or []),
+                    "image_prompts": list(getattr(youtube, "image_prompts", []) or []),
+                    "workspace_dir": getattr(youtube, "_workspace_dir", ""),
+                    "video_path": youtube.video_path,
                 }
                 st.session_state["youtube_generated_video"] = {
                     "account_id": account["id"],
@@ -1949,8 +2689,20 @@ def render_youtube_studio() -> None:
                     "metadata": youtube.metadata,
                     "subject": getattr(youtube, "subject", ""),
                     "script": getattr(youtube, "script", ""),
+                    "scene_units": list(getattr(youtube, "scene_units", []) or []),
+                    "image_prompts": list(getattr(youtube, "image_prompts", []) or []),
+                    "workspace_dir": getattr(youtube, "_workspace_dir", ""),
                 }
-                save_youtube_draft(account["id"], youtube.video_path, youtube.metadata)
+                save_youtube_draft(
+                    account["id"],
+                    youtube.video_path,
+                    youtube.metadata,
+                    workspace_dir=getattr(youtube, "_workspace_dir", ""),
+                    subject=getattr(youtube, "subject", ""),
+                    script=getattr(youtube, "script", ""),
+                    scene_units=list(getattr(youtube, "scene_units", []) or []),
+                    image_prompts=list(getattr(youtube, "image_prompts", []) or []),
+                )
                 st.success(f"Video generated with {provider}:{model}")
             except ImageRateLimitError as exc:
                 st.error(str(exc))
@@ -1999,40 +2751,154 @@ def render_youtube_studio() -> None:
                 st.error(str(exc))
                 st.code(traceback.format_exc())
 
-        st.markdown("---")
-        render_panel(
-            "Recovery",
-            "If the final video step fails after assets and voiceover were already created, rebuild the MP4 from the saved workspace without paying again for prompts, images, or TTS.",
-            soft=True,
-        )
         if recoverable_runs:
-            selected_recovery_workspace = st.selectbox(
-                "Recoverable run",
-                options=[run["workspace_dir"] for run in recoverable_runs],
-                format_func=lambda path: format_recoverable_run_option(
-                    next(run for run in recoverable_runs if run["workspace_dir"] == path)
-                ),
-                key=f"youtube_recoverable_run_{account['id']}",
+            with st.expander(f"Recovery ({len(recoverable_runs)} unfinished run{'s' if len(recoverable_runs) != 1 else ''})"):
+                selected_recovery_workspace = st.selectbox(
+                    "Recoverable run",
+                    options=[run["workspace_dir"] for run in recoverable_runs],
+                    format_func=lambda path: format_recoverable_run_option(
+                        next(run for run in recoverable_runs if run["workspace_dir"] == path)
+                    ),
+                    key=f"youtube_recoverable_run_{account['id']}",
+                )
+                selected_recovery_run = next(
+                    run for run in recoverable_runs if run["workspace_dir"] == selected_recovery_workspace
+                )
+                st.caption(f"Subject: {selected_recovery_run.get('subject', '(untitled)')}")
+                if st.button(
+                    "Retry Final Render",
+                    width="stretch",
+                    key=f"youtube_retry_render_{account['id']}",
+                ):
+                    try:
+                        progress_callback, log_capture = build_youtube_generation_monitor()
+                        youtube = YouTube(
+                            account["id"],
+                            account["nickname"],
+                            account["firefox_profile"],
+                            niche_override,
+                            language_override,
+                            dialect_override,
+                            context_override,
+                            account.get("is_for_kids"),
+                            open_browser=False,
+                        )
+                        youtube.set_progress_callback(progress_callback)
+                        with st.spinner("Rebuilding final video from saved assets..."), contextlib.redirect_stdout(log_capture), contextlib.redirect_stderr(log_capture):
+                            youtube.load_workspace_state(selected_recovery_workspace)
+                            youtube.rerender_video_from_workspace()
+                        log_capture.flush()
+
+                        st.session_state["youtube_preview"] = {
+                            "account_id": account["id"],
+                            "subject": getattr(youtube, "subject", ""),
+                            "script": getattr(youtube, "script", ""),
+                            "metadata": youtube.metadata,
+                            "scene_units": list(getattr(youtube, "scene_units", []) or []),
+                            "image_prompts": list(getattr(youtube, "image_prompts", []) or []),
+                            "workspace_dir": getattr(youtube, "_workspace_dir", ""),
+                            "video_path": youtube.video_path,
+                        }
+                        st.session_state["youtube_generated_video"] = {
+                            "account_id": account["id"],
+                            "video_path": youtube.video_path,
+                            "metadata": youtube.metadata,
+                            "subject": getattr(youtube, "subject", ""),
+                            "script": getattr(youtube, "script", ""),
+                            "scene_units": list(getattr(youtube, "scene_units", []) or []),
+                            "image_prompts": list(getattr(youtube, "image_prompts", []) or []),
+                            "workspace_dir": getattr(youtube, "_workspace_dir", ""),
+                        }
+                        save_youtube_draft(
+                            account["id"],
+                            youtube.video_path,
+                            youtube.metadata,
+                            workspace_dir=getattr(youtube, "_workspace_dir", ""),
+                            subject=getattr(youtube, "subject", ""),
+                            script=getattr(youtube, "script", ""),
+                            scene_units=list(getattr(youtube, "scene_units", []) or []),
+                            image_prompts=list(getattr(youtube, "image_prompts", []) or []),
+                        )
+                        st.success("Final video rebuilt from the saved workspace.")
+                    except Exception as exc:
+                        st.error(str(exc))
+                        with st.expander("Technical details", expanded=False):
+                            st.code(traceback.format_exc())
+
+    with preview_tab:
+        preview_payload = preview if preview.get("account_id") == account["id"] else {}
+        generated_payload = generated if generated.get("account_id") == account["id"] else {}
+        preview_source_payload = preview_payload or generated_payload
+
+        if preview_source_payload:
+            editor_payload, editor_action = render_youtube_scene_editor(
+                editor_key=f"yt_preview_editor_{account['id']}",
+                source_payload=preview_source_payload,
+                title="Preview Studio",
+                body="Adjust the transcript, refine scene prompts, and decide whether to save the edit, generate a new full video, or rebuild from the current workspace.",
+                show_video=True,
+                allow_generate_from_editor=True,
             )
-            selected_recovery_run = next(
-                run for run in recoverable_runs if run["workspace_dir"] == selected_recovery_workspace
-            )
-            st.markdown(
-                f"""
-                <div class="studio-note">
-                    <strong>Workspace</strong><br>
-                    <div style="white-space:pre-wrap;">{escape(selected_recovery_workspace)}</div>
-                    <br><strong>Subject</strong><br>
-                    <div style="white-space:pre-wrap;">{escape(str(selected_recovery_run.get("subject", "")))}</div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-            if st.button(
-                "Retry Final Render From Saved Assets",
-                width="stretch",
-                key=f"youtube_retry_render_{account['id']}",
-            ):
+            editor_action_type = editor_action.get("type") if isinstance(editor_action, dict) else ""
+
+            if editor_action_type == "save":
+                try:
+                    if editor_payload.get("workspace_dir"):
+                        youtube = YouTube(
+                            account["id"],
+                            account["nickname"],
+                            account["firefox_profile"],
+                            niche_override,
+                            language_override,
+                            dialect_override,
+                            context_override,
+                            account.get("is_for_kids"),
+                            open_browser=False,
+                        )
+                        youtube.apply_workspace_edits(
+                            editor_payload.get("workspace_dir"),
+                            subject=editor_payload.get("subject", ""),
+                            script=editor_payload.get("script", ""),
+                            metadata=editor_payload.get("metadata", {}),
+                            scene_units=editor_payload.get("scene_units", []),
+                            image_prompts=editor_payload.get("image_prompts", []),
+                        )
+
+                    preview_state = {
+                        "account_id": account["id"],
+                        "subject": editor_payload.get("subject", ""),
+                        "script": editor_payload.get("script", ""),
+                        "metadata": editor_payload.get("metadata", {}),
+                        "scene_units": editor_payload.get("scene_units", []),
+                        "image_prompts": editor_payload.get("image_prompts", []),
+                        "workspace_dir": editor_payload.get("workspace_dir", ""),
+                        "video_path": editor_payload.get("video_path", ""),
+                    }
+                    st.session_state["youtube_preview"] = preview_state
+                    if editor_payload.get("video_path"):
+                        st.session_state["youtube_generated_video"] = {
+                            **preview_state,
+                            "video_path": editor_payload.get("video_path", ""),
+                        }
+                        save_youtube_draft(
+                            account["id"],
+                            editor_payload.get("video_path", ""),
+                            editor_payload.get("metadata", {}),
+                            workspace_dir=editor_payload.get("workspace_dir", ""),
+                            subject=editor_payload.get("subject", ""),
+                            script=editor_payload.get("script", ""),
+                            scene_units=editor_payload.get("scene_units", []),
+                            image_prompts=editor_payload.get("image_prompts", []),
+                        )
+                    st.session_state.pop(f"yt_preview_editor_{account['id']}", None)
+                    st.success("Preview edits saved.")
+                except Exception as exc:
+                    st.error(str(exc))
+                    with st.expander("Technical details", expanded=False):
+                        st.code(traceback.format_exc())
+
+            elif editor_action_type in {"generate_from_editor", "regenerate_voiceover", "regenerate_scenes"}:
+                youtube = None
                 try:
                     progress_callback, log_capture = build_youtube_generation_monitor()
                     youtube = YouTube(
@@ -2047,9 +2913,32 @@ def render_youtube_studio() -> None:
                         open_browser=False,
                     )
                     youtube.set_progress_callback(progress_callback)
-                    with st.spinner("Rebuilding final video from saved assets..."), contextlib.redirect_stdout(log_capture), contextlib.redirect_stderr(log_capture):
-                        youtube.load_workspace_state(selected_recovery_workspace)
-                        youtube.rerender_video_from_workspace()
+
+                    with st.spinner("Applying editor changes..."), contextlib.redirect_stdout(log_capture), contextlib.redirect_stderr(log_capture):
+                        if editor_action_type == "generate_from_editor":
+                            youtube.generate_video_from_editor(
+                                TTS(),
+                                editor_payload.get("script", ""),
+                                editor_payload.get("subject", ""),
+                                metadata=editor_payload.get("metadata", {}),
+                                scene_units=editor_payload.get("scene_units", []),
+                                image_prompts=editor_payload.get("image_prompts", []),
+                            )
+                        elif editor_action_type in {"regenerate_voiceover", "regenerate_scenes"}:
+                            youtube.apply_workspace_edits(
+                                editor_payload.get("workspace_dir", ""),
+                                subject=editor_payload.get("subject", ""),
+                                script=editor_payload.get("script", ""),
+                                metadata=editor_payload.get("metadata", {}),
+                                scene_units=editor_payload.get("scene_units", []),
+                                image_prompts=editor_payload.get("image_prompts", []),
+                            )
+                            youtube.rebuild_video_from_workspace(
+                                TTS(),
+                                editor_payload.get("workspace_dir", ""),
+                                regenerate_voiceover=True,
+                                regenerate_assets=editor_action_type == "regenerate_scenes",
+                            )
                     log_capture.flush()
 
                     st.session_state["youtube_preview"] = {
@@ -2057,6 +2946,10 @@ def render_youtube_studio() -> None:
                         "subject": getattr(youtube, "subject", ""),
                         "script": getattr(youtube, "script", ""),
                         "metadata": youtube.metadata,
+                        "scene_units": list(getattr(youtube, "scene_units", []) or []),
+                        "image_prompts": list(getattr(youtube, "image_prompts", []) or []),
+                        "workspace_dir": getattr(youtube, "_workspace_dir", ""),
+                        "video_path": youtube.video_path,
                     }
                     st.session_state["youtube_generated_video"] = {
                         "account_id": account["id"],
@@ -2064,146 +2957,302 @@ def render_youtube_studio() -> None:
                         "metadata": youtube.metadata,
                         "subject": getattr(youtube, "subject", ""),
                         "script": getattr(youtube, "script", ""),
+                        "scene_units": list(getattr(youtube, "scene_units", []) or []),
+                        "image_prompts": list(getattr(youtube, "image_prompts", []) or []),
+                        "workspace_dir": getattr(youtube, "_workspace_dir", ""),
                     }
-                    save_youtube_draft(account["id"], youtube.video_path, youtube.metadata)
-                    st.success("Final video rebuilt from the saved workspace.")
+                    save_youtube_draft(
+                        account["id"],
+                        youtube.video_path,
+                        youtube.metadata,
+                        workspace_dir=getattr(youtube, "_workspace_dir", ""),
+                        subject=getattr(youtube, "subject", ""),
+                        script=getattr(youtube, "script", ""),
+                        scene_units=list(getattr(youtube, "scene_units", []) or []),
+                        image_prompts=list(getattr(youtube, "image_prompts", []) or []),
+                    )
+                    st.session_state.pop(f"yt_preview_editor_{account['id']}", None)
+                    if editor_action_type == "generate_from_editor":
+                        st.success("Generated a new full video from the edited preview.")
+                    elif editor_action_type == "regenerate_voiceover":
+                        st.success("Voiceover and final video were rebuilt from the edited draft.")
+                    else:
+                        st.success("Scenes, voiceover, and final video were rebuilt from the edited draft.")
+                except Exception as exc:
+                    st.error(str(exc))
+                    if youtube is not None and getattr(youtube, "_workspace_dir", None):
+                        st.info(f'Workspace kept at: {youtube._workspace_dir}')
+                    with st.expander("Technical details", expanded=False):
+                        st.code(traceback.format_exc())
+            elif editor_action_type == "regenerate_scene_asset":
+                try:
+                    youtube = YouTube(
+                        account["id"],
+                        account["nickname"],
+                        account["firefox_profile"],
+                        niche_override,
+                        language_override,
+                        dialect_override,
+                        context_override,
+                        account.get("is_for_kids"),
+                        open_browser=False,
+                    )
+                    youtube.apply_workspace_edits(
+                        editor_payload.get("workspace_dir", ""),
+                        subject=editor_payload.get("subject", ""),
+                        script=editor_payload.get("script", ""),
+                        metadata=editor_payload.get("metadata", {}),
+                        scene_units=editor_payload.get("scene_units", []),
+                        image_prompts=editor_payload.get("image_prompts", []),
+                    )
+                    if str(editor_action.get("provider", "")).lower() == "pixabay":
+                        picker_payload = youtube.list_pixabay_scene_candidates(
+                            int(editor_action.get("scene_index", 0) or 0),
+                            editor_payload.get("workspace_dir", ""),
+                        )
+                        st.session_state[YOUTUBE_PIXABAY_PICKER_STATE_KEY] = {
+                            **picker_payload,
+                            "account_id": account["id"],
+                            "editor_key": f"yt_preview_editor_{account['id']}",
+                            "editor_payload": editor_payload,
+                        }
+                    else:
+                        youtube.regenerate_scene_asset(
+                            int(editor_action.get("scene_index", 0) or 0),
+                            str(editor_action.get("provider", "nanobanana2") or "nanobanana2"),
+                            editor_payload.get("workspace_dir", ""),
+                        )
+                        persist_youtube_editor_result(account["id"], youtube)
+                        st.session_state.pop(f"yt_preview_editor_{account['id']}", None)
+                    if str(editor_action.get("provider", "")).lower() == "pixabay":
+                        st.info("Choose the Pixabay asset you want from the popup.")
+                    else:
+                        st.success(
+                            f"Scene {int(editor_action.get('scene_index', 0) or 0) + 1} asset regenerated via Nano Banana."
+                        )
                 except Exception as exc:
                     st.error(str(exc))
                     with st.expander("Technical details", expanded=False):
                         st.code(traceback.format_exc())
         else:
-            st.info("No recoverable unfinished runs found for this account right now.")
-
-    with preview_tab:
-        preview_payload = preview if preview.get("account_id") == account["id"] else {}
-        generated_payload = generated if generated.get("account_id") == account["id"] else {}
-
-        if preview_payload or generated_payload:
-            metadata = (
-                preview_payload.get("metadata", {})
-                if preview_payload
-                else generated_payload.get("metadata", {})
-            )
-            subject_value = (
-                preview_payload.get("subject", "")
-                if preview_payload
-                else generated_payload.get("subject", "")
-            )
-            script_value = (
-                preview_payload.get("script", "")
-                if preview_payload
-                else generated_payload.get("script", "")
-            )
-            preview_col, metadata_col = st.columns([1.15, 1])
-            with preview_col:
-                panel_copy = (
-                    "Review the direction here before you spend time and credits on full rendering."
-                    if preview_payload
-                    else "This preview was reconstructed from the latest full video generation for the current account."
-                )
-                render_panel("Topic + Script Preview", panel_copy, soft=True)
-                st.text_input("Topic", value=subject_value, disabled=True, key=f"yt_preview_topic_{account['id']}")
-                st.text_area("Script", value=script_value, height=260, disabled=True, key=f"yt_preview_script_{account['id']}")
-                generated_path = os.path.abspath(generated_payload.get("video_path", "")) if generated_payload else ""
-                if generated_path and os.path.exists(generated_path):
-                    st.video(generated_path)
-            with metadata_col:
-                render_panel("Metadata Preview", "Title, description, hashtags, and tags currently attached to this preview.", soft=True)
-                st.text_input("Title", value=metadata.get("title", ""), disabled=True, key=f"yt_preview_title_{account['id']}")
-                st.text_area("Description", value=metadata.get("description", ""), height=160, disabled=True, key=f"yt_preview_description_{account['id']}")
-                render_chip_row("Hashtags", metadata.get("hashtags", []))
-                render_chip_row("Tags", metadata.get("tags", []), muted=True)
-        else:
             st.info("No preview yet. Generate an idea/script preview from the Create tab.")
 
     with drafts_tab:
-        st.markdown("#### Draft Library")
         if drafts:
-            selected_draft_path = st.selectbox(
-                "Choose a draft",
-                options=[draft["video_path"] for draft in drafts],
-                format_func=lambda path: format_draft_option(
-                    next(draft for draft in drafts if draft["video_path"] == path)
-                ),
-                key=f"youtube_draft_select_{account['id']}",
-            )
+            # Draft selector + upload + cost in one compact row
+            draft_sel_col, draft_upload_col, draft_cost_col = st.columns([2, 0.8, 0.6])
+            with draft_sel_col:
+                selected_draft_path = st.selectbox(
+                    "Draft",
+                    options=[draft["video_path"] for draft in drafts],
+                    format_func=lambda path: format_draft_option(
+                        next(draft for draft in drafts if draft["video_path"] == path)
+                    ),
+                    key=f"youtube_draft_select_{account['id']}",
+                    label_visibility="collapsed",
+                )
             selected_draft = next(draft for draft in drafts if draft["video_path"] == selected_draft_path)
             selected_metadata = selected_draft.get("metadata", {})
+            selected_pricing = load_pricing_for_video(selected_draft_path, selected_metadata)
+            with draft_cost_col:
+                if selected_pricing:
+                    cost_val = float(selected_pricing.get('total_estimated_cost', 0.0) or 0.0)
+                    st.metric("Cost", f"${cost_val:.3f}")
+                else:
+                    st.metric("Cost", "N/A")
 
-            preview_col, details_col = st.columns([1.25, 1])
-            with preview_col:
-                st.markdown(
-                    f"""
-                    <div class="studio-card">
-                        <div class="studio-eyebrow">Selected Draft</div>
-                        <div class="studio-title" dir="auto">{escape(str(selected_metadata.get("title", "(untitled)")))}</div>
-                        <div class="studio-subtitle">
-                            {escape(str(selected_draft.get("created_at", "")).replace("T", " "))}
-                        </div>
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
-                )
-                if os.path.exists(selected_draft_path):
-                    st.video(selected_draft_path)
-                st.markdown(
-                    f'<div class="studio-path">{escape(selected_draft_path)}</div>',
-                    unsafe_allow_html=True,
-                )
+            editor_payload, editor_action = render_youtube_scene_editor(
+                editor_key=f"yt_draft_editor_{account['id']}",
+                source_payload=selected_draft,
+                title="Draft Editor",
+                body="",
+                show_video=True,
+                allow_generate_from_editor=False,
+            )
+            editor_action_type = editor_action.get("type") if isinstance(editor_action, dict) else ""
 
-            with details_col:
-                render_kv_card(
-                    "Video Summary",
-                    str(selected_metadata.get("title", "(untitled)")),
-                    [
-                        ("Language", str(account.get("language", "English"))),
-                        ("Dialect", str(account.get("dialect", "") or "Default")),
-                        ("Niche", str(account.get("niche", ""))),
-                        ("Drafts", str(len(drafts))),
-                    ],
-                )
-                st.text_area(
-                    "Description",
-                    value=selected_metadata.get("description", ""),
-                    height=170,
-                    disabled=True,
-                    key=f"youtube_selected_description_{account['id']}",
-                )
+            if draft_upload_col.button("Upload", width="stretch", key=f"upload_selected_draft_{account['id']}", type="primary"):
+                try:
+                    youtube = YouTube(
+                        account["id"],
+                        account["nickname"],
+                        account["firefox_profile"],
+                        account.get("niche", ""),
+                        account.get("language", "English"),
+                        account.get("dialect", ""),
+                        account.get("character_context", ""),
+                        account.get("is_for_kids"),
+                        open_browser=True,
+                    )
+                    youtube.video_path = selected_draft_path
+                    youtube.metadata = editor_payload.get("metadata", {})
+                    if youtube.upload_video():
+                        st.success("Video uploaded.")
+                    else:
+                        st.error("Upload failed.")
+                except Exception as exc:
+                    st.error(str(exc))
+                    with st.expander("Technical details", expanded=False):
+                        st.code(traceback.format_exc())
 
-                upload_col, info_col = st.columns([1.2, 0.8])
-                if upload_col.button("Upload Selected Draft", width="stretch", key=f"upload_selected_draft_{account['id']}"):
-                    try:
+            if editor_action:
+                try:
+                    if editor_action_type == "save":
+                        if editor_payload.get("workspace_dir"):
+                            youtube = YouTube(
+                                account["id"],
+                                account["nickname"],
+                                account["firefox_profile"],
+                                niche_override,
+                                language_override,
+                                dialect_override,
+                                context_override,
+                                account.get("is_for_kids"),
+                                open_browser=False,
+                            )
+                            youtube.apply_workspace_edits(
+                                editor_payload.get("workspace_dir", ""),
+                                subject=editor_payload.get("subject", ""),
+                                script=editor_payload.get("script", ""),
+                                metadata=editor_payload.get("metadata", {}),
+                                scene_units=editor_payload.get("scene_units", []),
+                                image_prompts=editor_payload.get("image_prompts", []),
+                            )
+
+                        save_youtube_draft(
+                            account["id"],
+                            editor_payload.get("video_path", selected_draft_path),
+                            editor_payload.get("metadata", {}),
+                            workspace_dir=editor_payload.get("workspace_dir", ""),
+                            subject=editor_payload.get("subject", ""),
+                            script=editor_payload.get("script", ""),
+                            scene_units=editor_payload.get("scene_units", []),
+                            image_prompts=editor_payload.get("image_prompts", []),
+                        )
+                        st.session_state.pop(f"yt_draft_editor_{account['id']}", None)
+                        st.success("Draft edits saved.")
+                    elif editor_action_type in {"regenerate_voiceover", "regenerate_scenes"}:
+                        progress_callback, log_capture = build_youtube_generation_monitor()
                         youtube = YouTube(
                             account["id"],
                             account["nickname"],
                             account["firefox_profile"],
-                            account.get("niche", ""),
-                            account.get("language", "English"),
-                            account.get("dialect", ""),
-                            account.get("character_context", ""),
+                            niche_override,
+                            language_override,
+                            dialect_override,
+                            context_override,
                             account.get("is_for_kids"),
-                            open_browser=True,
+                            open_browser=False,
                         )
-                        youtube.video_path = selected_draft_path
-                        youtube.metadata = selected_metadata
-                        if youtube.upload_video():
-                            st.success("Video uploaded.")
-                        else:
-                            st.error("Upload failed.")
-                    except Exception as exc:
-                        st.error(str(exc))
-                        with st.expander("Technical details", expanded=False):
-                            st.code(traceback.format_exc())
+                        youtube.set_progress_callback(progress_callback)
+                        with st.spinner("Rebuilding edited draft..."), contextlib.redirect_stdout(log_capture), contextlib.redirect_stderr(log_capture):
+                            youtube.apply_workspace_edits(
+                                editor_payload.get("workspace_dir", ""),
+                                subject=editor_payload.get("subject", ""),
+                                script=editor_payload.get("script", ""),
+                                metadata=editor_payload.get("metadata", {}),
+                                scene_units=editor_payload.get("scene_units", []),
+                                image_prompts=editor_payload.get("image_prompts", []),
+                            )
+                            if editor_action_type == "regenerate_scene_asset":
+                                youtube.regenerate_scene_asset(
+                                    int(editor_action.get("scene_index", 0) or 0),
+                                    str(editor_action.get("provider", "pixabay") or "pixabay"),
+                                    editor_payload.get("workspace_dir", ""),
+                                )
+                            else:
+                                youtube.rebuild_video_from_workspace(
+                                    TTS(),
+                                    editor_payload.get("workspace_dir", ""),
+                                    regenerate_voiceover=True,
+                                    regenerate_assets=editor_action_type == "regenerate_scenes",
+                                )
+                        log_capture.flush()
 
-                info_col.metric("Drafts", len(drafts))
-                selected_pricing = load_pricing_for_video(selected_draft_path, selected_metadata)
-                if selected_pricing:
-                    info_col.metric(
-                        "Estimated Cost",
-                        f"{float(selected_pricing.get('total_estimated_cost', 0.0) or 0.0):.4f} {selected_pricing.get('currency', 'USD')}",
-                    )
-                render_chip_row("Hashtags", selected_metadata.get("hashtags", []))
-                render_chip_row("Tags", selected_metadata.get("tags", []), muted=True)
+                        st.session_state["youtube_preview"] = {
+                            "account_id": account["id"],
+                            "subject": getattr(youtube, "subject", ""),
+                            "script": getattr(youtube, "script", ""),
+                            "metadata": youtube.metadata,
+                            "scene_units": list(getattr(youtube, "scene_units", []) or []),
+                            "image_prompts": list(getattr(youtube, "image_prompts", []) or []),
+                            "workspace_dir": getattr(youtube, "_workspace_dir", ""),
+                            "video_path": youtube.video_path,
+                        }
+                        st.session_state["youtube_generated_video"] = {
+                            "account_id": account["id"],
+                            "video_path": youtube.video_path,
+                            "metadata": youtube.metadata,
+                            "subject": getattr(youtube, "subject", ""),
+                            "script": getattr(youtube, "script", ""),
+                            "scene_units": list(getattr(youtube, "scene_units", []) or []),
+                            "image_prompts": list(getattr(youtube, "image_prompts", []) or []),
+                            "workspace_dir": getattr(youtube, "_workspace_dir", ""),
+                        }
+                        save_youtube_draft(
+                            account["id"],
+                            youtube.video_path,
+                            youtube.metadata,
+                            workspace_dir=getattr(youtube, "_workspace_dir", ""),
+                            subject=getattr(youtube, "subject", ""),
+                            script=getattr(youtube, "script", ""),
+                            scene_units=list(getattr(youtube, "scene_units", []) or []),
+                            image_prompts=list(getattr(youtube, "image_prompts", []) or []),
+                        )
+                        st.session_state.pop(f"yt_draft_editor_{account['id']}", None)
+                        if editor_action_type == "regenerate_voiceover":
+                            st.success("Draft voiceover and video rebuilt.")
+                        else:
+                            st.success("Draft scenes, voiceover, and video rebuilt.")
+                    elif editor_action_type == "regenerate_scene_asset":
+                        youtube = YouTube(
+                            account["id"],
+                            account["nickname"],
+                            account["firefox_profile"],
+                            niche_override,
+                            language_override,
+                            dialect_override,
+                            context_override,
+                            account.get("is_for_kids"),
+                            open_browser=False,
+                        )
+                        youtube.apply_workspace_edits(
+                            editor_payload.get("workspace_dir", ""),
+                            subject=editor_payload.get("subject", ""),
+                            script=editor_payload.get("script", ""),
+                            metadata=editor_payload.get("metadata", {}),
+                            scene_units=editor_payload.get("scene_units", []),
+                            image_prompts=editor_payload.get("image_prompts", []),
+                        )
+                        if str(editor_action.get("provider", "")).lower() == "pixabay":
+                            picker_payload = youtube.list_pixabay_scene_candidates(
+                                int(editor_action.get("scene_index", 0) or 0),
+                                editor_payload.get("workspace_dir", ""),
+                            )
+                            st.session_state[YOUTUBE_PIXABAY_PICKER_STATE_KEY] = {
+                                **picker_payload,
+                                "account_id": account["id"],
+                                "editor_key": f"yt_draft_editor_{account['id']}",
+                                "editor_payload": editor_payload,
+                            }
+                        else:
+                            youtube.regenerate_scene_asset(
+                                int(editor_action.get("scene_index", 0) or 0),
+                                str(editor_action.get("provider", "nanobanana2") or "nanobanana2"),
+                                editor_payload.get("workspace_dir", ""),
+                            )
+                            persist_youtube_editor_result(account["id"], youtube)
+                            st.session_state.pop(f"yt_draft_editor_{account['id']}", None)
+                        if str(editor_action.get("provider", "")).lower() == "pixabay":
+                            st.info("Choose the Pixabay asset you want from the popup.")
+                        else:
+                            st.success(
+                                f"Scene {int(editor_action.get('scene_index', 0) or 0) + 1} asset regenerated via Nano Banana."
+                            )
+                except Exception as exc:
+                    st.error(str(exc))
+                    with st.expander("Technical details", expanded=False):
+                        st.code(traceback.format_exc())
         else:
             st.info("No saved drafts yet. Generate a video or import an existing MP4 to start building a draft library.")
 
@@ -2236,6 +3285,10 @@ def render_youtube_studio() -> None:
                             "title": import_title.strip(),
                             "description": import_description.strip(),
                         },
+                        subject=preview.get("subject", ""),
+                        script=preview.get("script", ""),
+                        scene_units=list(preview.get("scene_units", []) or []),
+                        image_prompts=list(preview.get("image_prompts", []) or []),
                     )
                     st.success("Video draft saved. You can now use Upload Latest Draft.")
                     st.rerun()
@@ -2295,38 +3348,53 @@ def render_youtube_studio() -> None:
         else:
             st.info("Generate or save a draft first to see its pricing breakdown.")
 
+    picker_state = st.session_state.get(YOUTUBE_PIXABAY_PICKER_STATE_KEY, {})
+    if isinstance(picker_state, dict) and picker_state.get("account_id") == account["id"]:
+        render_youtube_pixabay_picker_dialog(
+            account,
+            niche_override,
+            language_override,
+            dialect_override,
+            context_override,
+        )
+
 
 def render_tiktok_studio() -> None:
-    render_section_intro(
-        "TikTok Studio",
-        "Choose an existing source video or generate a new one here, then shape the caption before uploading through your saved browser profile.",
-        eyebrow="Short-Form Repurposing",
-    )
     accounts = get_accounts("tiktok")
     if not accounts:
-        st.info("Create a TikTok account first.")
+        st.info("Create a TikTok account first in the Accounts page.")
         return
 
-    account_id = st.selectbox(
-        "TikTok account",
-        options=[account["id"] for account in accounts],
-        format_func=lambda selected_id: next(
-            f'{account["nickname"]} - {account.get("niche", "")}'
-            for account in accounts
-            if account["id"] == selected_id
-        ),
-        key="tiktok_studio_account_select",
-    )
+    sel_col, stat_col = st.columns([3, 0.5])
+    with sel_col:
+        account_id = st.selectbox(
+            "TikTok account",
+            options=[account["id"] for account in accounts],
+            format_func=lambda selected_id: next(
+                f'{account["nickname"]} — {account.get("niche", "")} ({account.get("language", "")})'
+                for account in accounts
+                if account["id"] == selected_id
+            ),
+            key="tiktok_studio_account_select",
+        )
     account = next(account for account in accounts if account["id"] == account_id)
+    with stat_col:
+        st.metric("Uploads", len(account.get("videos", [])))
 
-    niche_override = st.text_input("Niche override", value=account.get("niche", ""), key="tiktok_niche_override")
-    language_override = st.text_input("Language override", value=account.get("language", "English"), key="tiktok_language_override")
-    dialect_override = st.text_input("Dialect override", value=account.get("dialect", ""), key="tiktok_dialect_override")
-    context_override = st.text_area(
-        "Character context override",
-        value=account.get("character_context", ""),
-        key="tiktok_context_override",
-    )
+    with st.expander("Channel overrides", expanded=False):
+        ov_left, ov_right = st.columns([1, 1.2])
+        with ov_left:
+            niche_override = st.text_input("Niche", value=account.get("niche", ""), key="tiktok_niche_override")
+            language_override = st.text_input("Language", value=account.get("language", "English"), key="tiktok_language_override")
+            dialect_override = st.text_input("Dialect", value=account.get("dialect", ""), key="tiktok_dialect_override")
+        with ov_right:
+            context_override = st.text_area(
+                "Character context",
+                value=account.get("character_context", ""),
+                key="tiktok_context_override",
+                height=140,
+            )
+
     script_mode = st.radio(
         "Script source",
         options=["Generate with AI", "Write manually"],
@@ -2337,15 +3405,14 @@ def render_tiktok_studio() -> None:
     manual_script = ""
     if script_mode == "Write manually":
         manual_subject = st.text_input(
-            "Manual topic / angle (optional)",
+            "Topic / angle (optional)",
             key=f"tiktok_manual_subject_{account['id']}",
-            help="If left empty, the app will derive the topic from the script.",
+            help="If left empty, derived from the script.",
         )
         manual_script = st.text_area(
-            "Manual video script",
+            "Video script",
             key=f"tiktok_manual_script_{account['id']}",
-            height=220,
-            help="Paste the narration you want, then let the app generate the rest of the video around it.",
+            height=200,
         )
 
     render_kv_card(
@@ -2656,43 +3723,133 @@ def render_tiktok_studio() -> None:
                     st.write(video.get("url", ""))
 
 
+PAGES = {
+    "Overview": "overview",
+    "Configuration": "config",
+    "Accounts": "accounts",
+    "YouTube Studio": "youtube_studio",
+    "Twitter Studio": "twitter_studio",
+    "TikTok Studio": "tiktok_studio",
+}
+
+SIDEBAR_SECTIONS = {
+    "Home": ["Overview"],
+    "Create": ["YouTube Studio", "Twitter Studio", "TikTok Studio"],
+    "Manage": ["Accounts", "Configuration"],
+}
+
+
+def render_sidebar_status() -> None:
+    config = load_config()
+    provider = config.get("llm_provider", "ollama")
+    model = config.get("openai_model") if provider == "openai" else config.get("ollama_model")
+    st.sidebar.markdown(
+        f"""
+        <div style="
+            padding: 0.7rem 0.8rem;
+            border-radius: 16px;
+            background: rgba(31, 122, 90, 0.08);
+            border: 1px solid rgba(31, 122, 90, 0.12);
+            margin-bottom: 0.6rem;
+            font-size: 0.82rem;
+            line-height: 1.6;
+            color: var(--studio-ink-soft);
+        ">
+            <strong style="color: var(--studio-ink);">Active Profile</strong><br>
+            LLM: <strong>{escape(provider)}</strong> / {escape(model or "Not set")}<br>
+            Images: <strong>{escape(config.get("image_provider", "nanobanana2"))}</strong> ({escape(config.get("asset_strategy", "mixed"))})<br>
+            TTS: <strong>{escape(config.get("tts_provider", "auto"))}</strong><br>
+            FPS: <strong>{config.get("video_fps", 30)}</strong> &middot;
+            SFX: <strong>{"On" if config.get("sound_effects_enabled") else "Off"}</strong>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_accounts_page() -> None:
+    render_section_intro(
+        "Accounts",
+        "Manage all your platform accounts in one place. Select a platform to view, edit, or create accounts.",
+        eyebrow="Account Management",
+    )
+    platform = st.selectbox(
+        "Platform",
+        options=["youtube", "twitter", "tiktok"],
+        format_func=lambda p: p.title(),
+        key="accounts_platform_select",
+    )
+    render_account_editor(platform)
+
+
 def main() -> None:
     st.set_page_config(
         page_title="MoneyPrinter V2 Studio",
+        page_icon="https://img.icons8.com/fluency/48/movie-projector.png",
         layout="wide",
     )
 
     inject_app_styles()
 
-    tabs = st.tabs(
-        [
-            "Overview",
-            "Config",
-            "Twitter Accounts",
-            "YouTube Accounts",
-            "TikTok Accounts",
-            "Twitter Studio",
-            "YouTube Studio",
-            "TikTok Studio",
-        ]
+    # Sidebar navigation
+    st.sidebar.markdown(
+        """
+        <div style="
+            padding: 0.5rem 0 0.8rem;
+            text-align: center;
+        ">
+            <div style="font-size: 1.35rem; font-weight: 800; color: var(--studio-ink); line-height: 1.2;">
+                MoneyPrinter V2
+            </div>
+            <div style="font-size: 0.75rem; color: var(--studio-ink-soft); letter-spacing: 0.08em; text-transform: uppercase;">
+                Studio
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
     )
 
-    with tabs[0]:
+    render_sidebar_status()
+
+    if "current_page" not in st.session_state:
+        st.session_state["current_page"] = "overview"
+
+    for section_label, page_names in SIDEBAR_SECTIONS.items():
+        st.sidebar.markdown(
+            f'<div style="font-size: 0.7rem; letter-spacing: 0.1em; text-transform: uppercase; '
+            f'color: #668072; font-weight: 700; padding: 0.6rem 0 0.25rem 0.2rem;">'
+            f'{escape(section_label)}</div>',
+            unsafe_allow_html=True,
+        )
+        for page_name in page_names:
+            page_key = PAGES[page_name]
+            is_active = st.session_state["current_page"] == page_key
+            if st.sidebar.button(
+                page_name,
+                key=f"nav_{page_key}",
+                use_container_width=True,
+                type="primary" if is_active else "secondary",
+            ):
+                st.session_state["current_page"] = page_key
+                st.rerun()
+
+    # Render selected page
+    page = st.session_state.get("current_page", "overview")
+
+    if page == "overview":
         render_overview()
-    with tabs[1]:
+    elif page == "config":
         render_config_tab()
-    with tabs[2]:
-        render_account_editor("twitter")
-    with tabs[3]:
-        render_account_editor("youtube")
-    with tabs[4]:
-        render_account_editor("tiktok")
-    with tabs[5]:
-        render_twitter_studio()
-    with tabs[6]:
+    elif page == "accounts":
+        render_accounts_page()
+    elif page == "youtube_studio":
         render_youtube_studio()
-    with tabs[7]:
+    elif page == "twitter_studio":
+        render_twitter_studio()
+    elif page == "tiktok_studio":
         render_tiktok_studio()
+    else:
+        render_overview()
 
 
 if __name__ == "__main__":

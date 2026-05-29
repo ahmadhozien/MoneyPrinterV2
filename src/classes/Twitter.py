@@ -3,7 +3,6 @@ import sys
 import time
 import os
 import json
-import subprocess
 
 from cache import *
 from config import *
@@ -95,21 +94,7 @@ class Twitter:
             None
         """
         lock_path = os.path.join(profile_path, "parent.lock")
-        if not os.path.exists(lock_path):
-            return
-
-        try:
-            result = subprocess.run(
-                ["tasklist", "/FI", "IMAGENAME eq firefox.exe"],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            firefox_running = "firefox.exe" in result.stdout.lower()
-        except Exception:
-            firefox_running = True
-
-        if firefox_running:
+        if os.path.exists(lock_path):
             raise RuntimeError(
                 "The selected Firefox profile is currently in use. Close Firefox completely and try again."
             )

@@ -1,4 +1,8 @@
-# MoneyPrinter V2
+# MoneyPrinter V2 — ahmadhozien fork
+
+> 🍴 **This is a modified fork** of [FujiwaraChoki/MoneyPrinterV2](https://github.com/FujiwaraChoki/MoneyPrinterV2),
+> maintained by [@ahmadhozien](https://github.com/ahmadhozien). It is distributed under the same
+> **AGPL-3.0** license as the original. See [Changes in this fork](#changes-in-this-fork) below.
 
 > ♥︎ **Sponsor**: The Best AI Chat App: [shiori.ai](https://www.shiori.ai)
 
@@ -35,6 +39,18 @@ MoneyPrinter has different versions for multiple languages developed by the comm
 - Chinese: [MoneyPrinterTurbo](https://github.com/harry0703/MoneyPrinterTurbo)
 
 If you would like to submit your own version/fork of MoneyPrinter, please open an issue describing the changes you made to the fork.
+
+## Changes in this fork
+
+This fork (by [@ahmadhozien](https://github.com/ahmadhozien)) adds the following on top of upstream
+[FujiwaraChoki/MoneyPrinterV2](https://github.com/FujiwaraChoki/MoneyPrinterV2):
+
+- **TikTok uploader** for generated short-form videos, with supporting scripts.
+- **YouTube pipeline improvements** — cultural-safety filtering and smarter asset selection.
+- **Firefox profile lock fix** across all automation classes (YouTube, Twitter, AFM, TikTok) — you
+  can now run automation while a *different* Firefox profile is open in another window.
+- **GUI enhancements** in `app_gui.py`.
+- **Updated SFX assets** in `sfx/`.
 
 ## Installation
 
