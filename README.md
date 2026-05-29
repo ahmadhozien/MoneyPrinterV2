@@ -1,15 +1,8 @@
 # MoneyPrinter V2 — ahmadhozien fork
 
-> 🍴 **This is a modified fork** of [FujiwaraChoki/MoneyPrinterV2](https://github.com/FujiwaraChoki/MoneyPrinterV2),
-> maintained by [@ahmadhozien](https://github.com/ahmadhozien). It is distributed under the same
-> **AGPL-3.0** license as the original. See [Changes in this fork](#changes-in-this-fork) below.
-
-Sponsored by Post Bridge
-
-<a href="https://post-bridge.com?atp=MoneyPrinter">
-  <img src="docs/repo/PostBridgeBanner.png" alt="Post Bridge integration banner" width="720" />
-</a>
-
+> 🍴 A modified fork of [FujiwaraChoki/MoneyPrinterV2](https://github.com/FujiwaraChoki/MoneyPrinterV2),
+> maintained by [@ahmadhozien](https://github.com/ahmadhozien) and distributed under the same
+> **AGPL-3.0** license. See [Changes in this fork](#changes-in-this-fork) and [Credits](#credits).
 
 [![Based on FujiwaraChoki/MoneyPrinterV2](https://img.shields.io/badge/based_on-FujiwaraChoki%2FMoneyPrinterV2-blue?style=for-the-badge&logo=github)](https://github.com/FujiwaraChoki/MoneyPrinterV2)
 
@@ -17,38 +10,28 @@ Sponsored by Post Bridge
 [![GitHub issues](https://img.shields.io/github/issues/ahmadhozien/MoneyPrinterV2?style=for-the-badge)](https://github.com/ahmadhozien/MoneyPrinterV2/issues)
 [![GitHub stars](https://img.shields.io/github/stars/ahmadhozien/MoneyPrinterV2?style=for-the-badge)](https://github.com/ahmadhozien/MoneyPrinterV2/stargazers)
 
-An Application that automates the process of making money online.
-MPV2 (MoneyPrinter Version 2) is, as the name suggests, the second version of the MoneyPrinter project. It is a complete rewrite of the original project, with a focus on a wider range of features and a more modular architecture.
-
-> **Note:** MPV2 needs Python 3.12 to function effectively.
-> Watch the YouTube video [here](https://youtu.be/wAZ_ZSuIqfk)
+A Python 3.12 CLI (and Streamlit GUI) that automates short-form content creation and social-media
+outreach end to end: it writes the script, generates the voiceover and visuals, composites a
+captioned video, and uploads it — plus tooling for Twitter/X, affiliate marketing, and cold outreach.
 
 ## Features
 
 - [x] **YouTube Shorts automator** — full pipeline: LLM script → TTS voiceover → AI images / stock
       footage → MoviePy composite with word-by-word subtitles and sound effects → Selenium upload
-      (with CRON Jobs => `scheduler`)
+      (schedulable via the built-in `scheduler`)
 - [x] **TikTok uploader** for the generated short-form videos
-- [x] **Twitter/X bot** (with CRON Jobs => `scheduler`)
-- [x] **Affiliate Marketing** (Amazon + Twitter)
-- [x] **Local business outreach** — scrape Google Maps, extract emails, send cold outreach
+- [x] **Twitter/X bot** — generate and post tweets (schedulable)
+- [x] **Affiliate marketing** — scrape Amazon products, generate a pitch, share on Twitter
+- [x] **Local business outreach** — scrape Google Maps, extract emails, send cold outreach via SMTP
 - [x] **Cross-posting** to TikTok / Instagram via [Post Bridge](https://www.post-bridge.com)
 - [x] **Streamlit GUI** dashboard (`app_gui.py`) in addition to the CLI
 - [x] **Multi-provider** support for LLM, image, TTS, and STT (see [Configuration](#configuration))
 - [x] **Bilingual subtitles** (English + Arabic) and per-keyword sound effects
 - [x] **Cost tracking** for paid API providers
 
-## Versions
-
-MoneyPrinter has different versions for multiple languages developed by the community for the community. Here are some known versions:
-
-- Chinese: [MoneyPrinterTurbo](https://github.com/harry0703/MoneyPrinterTurbo)
-
-If you would like to submit your own version/fork of MoneyPrinter, please open an issue describing the changes you made to the fork.
-
 ## Changes in this fork
 
-This fork (by [@ahmadhozien](https://github.com/ahmadhozien)) adds the following on top of upstream
+This fork adds the following on top of upstream
 [FujiwaraChoki/MoneyPrinterV2](https://github.com/FujiwaraChoki/MoneyPrinterV2):
 
 - **TikTok uploader** for the generated short-form videos, with supporting scripts.
@@ -149,53 +132,55 @@ For headless / scheduled runs, the scheduler invokes:
 python src/cron.py <platform> <account_uuid>
 ```
 
-## GUI
+### GUI
 
-You can also run the first Streamlit-based GUI:
+You can also run the Streamlit-based dashboard:
 
 ```bash
 streamlit run app_gui.py
 ```
 
-On Windows, you can also use the included launcher scripts:
+On Windows, use the included launchers instead:
 
 ```bash
 run_gui.bat
 ```
 
-or:
-
 ```powershell
 .\run_gui.ps1
 ```
 
+### Helper scripts
+
+The `scripts/` directory contains standalone helpers (e.g. `scripts/upload_video.sh`) that access
+core functionality without the interactive menu. Run them from the project root.
+
 ## Documentation
 
-All relevant documents can be found [here](docs/).
-
-## Scripts
-
-For easier usage, there are some scripts in the `scripts` directory that can be used to directly access the core functionality of MPV2 without the need for user interaction.
-
-All scripts need to be run from the root directory of the project, e.g. `bash scripts/upload_video.sh`.
+Additional reference docs live in [docs/](docs/), including the full
+[configuration reference](docs/Configuration.md).
 
 ## Contributing
 
-Please read [CONTRIBUTING.md](CONTRIBUTING.md) for details on our code of conduct, and the process for submitting pull requests to us. Check out [docs/Roadmap.md](docs/Roadmap.md) for a list of features that need to be implemented.
-
-## Code of Conduct
-
-Please read [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) for details on our code of conduct, and the process for submitting pull requests to us.
+Issues and pull requests are welcome on
+[this fork](https://github.com/ahmadhozien/MoneyPrinterV2). Please read
+[CONTRIBUTING.md](CONTRIBUTING.md) and [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) first.
 
 ## License
 
-MoneyPrinterV2 is licensed under `Affero General Public License v3.0`. See [LICENSE](LICENSE) for more information.
+This project is licensed under the **GNU Affero General Public License v3.0** — the same license as
+the upstream project. See [LICENSE](LICENSE). Under AGPL-3.0, any modified version you distribute or
+run as a network service must also be made available under AGPL-3.0.
 
-## Acknowledgments
+## Credits
 
-- [KittenTTS](https://github.com/KittenML/KittenTTS)
-- [gpt4free](https://github.com/xtekky/gpt4free)
+- Original project: [FujiwaraChoki/MoneyPrinterV2](https://github.com/FujiwaraChoki/MoneyPrinterV2)
+  by [@FujiwaraChoki](https://github.com/FujiwaraChoki) — this fork builds directly on it.
+- [KittenTTS](https://github.com/KittenML/KittenTTS) — local text-to-speech.
 
 ## Disclaimer
 
-This project is for educational purposes only. The author will not be responsible for any misuse of the information provided. All the information on this website is published in good faith and for general information purposes only. The author does not make any warranties about the completeness, reliability, and accuracy of this information. Any action you take upon the information you find on this website (FujiwaraChoki/MoneyPrinterV2) is strictly at your own risk. The author will not be liable for any losses and/or damages in connection with the use of our website.
+This project is provided for educational purposes only. The maintainers make no warranties about its
+completeness, reliability, or accuracy, and accept no liability for any misuse, losses, or damages
+arising from its use. You are responsible for complying with the terms of service of any platform you
+automate with it, and with all applicable laws.
