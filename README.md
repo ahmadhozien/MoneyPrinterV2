@@ -27,11 +27,18 @@ MPV2 (MoneyPrinter Version 2) is, as the name suggests, the second version of th
 
 ## Features
 
-- [x] Twitter Bot (with CRON Jobs => `scheduler`)
-- [x] YouTube Shorts Automator (with CRON Jobs => `scheduler`)
-- [x] TikTok uploader for generated short-form videos
-- [x] Affiliate Marketing (Amazon + Twitter)
-- [x] Find local businesses & cold outreach
+- [x] **YouTube Shorts automator** — full pipeline: LLM script → TTS voiceover → AI images / stock
+      footage → MoviePy composite with word-by-word subtitles and sound effects → Selenium upload
+      (with CRON Jobs => `scheduler`)
+- [x] **TikTok uploader** for the generated short-form videos
+- [x] **Twitter/X bot** (with CRON Jobs => `scheduler`)
+- [x] **Affiliate Marketing** (Amazon + Twitter)
+- [x] **Local business outreach** — scrape Google Maps, extract emails, send cold outreach
+- [x] **Cross-posting** to TikTok / Instagram via [Post Bridge](https://www.post-bridge.com)
+- [x] **Streamlit GUI** dashboard (`app_gui.py`) in addition to the CLI
+- [x] **Multi-provider** support for LLM, image, TTS, and STT (see [Configuration](#configuration))
+- [x] **Bilingual subtitles** (English + Arabic) and per-keyword sound effects
+- [x] **Cost tracking** for paid API providers
 
 ## Versions
 
@@ -46,42 +53,102 @@ If you would like to submit your own version/fork of MoneyPrinter, please open a
 This fork (by [@ahmadhozien](https://github.com/ahmadhozien)) adds the following on top of upstream
 [FujiwaraChoki/MoneyPrinterV2](https://github.com/FujiwaraChoki/MoneyPrinterV2):
 
-- **TikTok uploader** for generated short-form videos, with supporting scripts.
-- **YouTube pipeline improvements** — cultural-safety filtering and smarter asset selection.
+- **TikTok uploader** for the generated short-form videos, with supporting scripts.
+- **Multiple LLM/image/TTS/STT providers** — OpenAI (LLM, image, TTS), OpenRouter and Pixabay for
+  visuals, Nano Banana 2 (Gemini) image generation, local Whisper or AssemblyAI for subtitles.
+  All cloud providers are called over plain HTTP, so no extra vendor SDKs are required.
+- **YouTube pipeline improvements** — cultural-safety filtering, smarter asset selection
+  (`asset_strategy`: AI images, stock footage, or mixed), and a configurable target duration.
+- **Bilingual subtitles** — separate English and Arabic fonts with word-by-word rendering.
+- **Sound effects engine** — maps trigger words to SFX clips, with volume/offset controls.
+- **Cost tracking** — per-provider pricing in `config.json` to estimate run costs.
+- **Streamlit GUI** (`app_gui.py`) with Windows launcher scripts (`run_gui.bat`, `run_gui.ps1`).
 - **Firefox profile lock fix** across all automation classes (YouTube, Twitter, AFM, TikTok) — you
   can now run automation while a *different* Firefox profile is open in another window.
-- **GUI enhancements** in `app_gui.py`.
-- **Updated SFX assets** in `sfx/`.
+
+## Prerequisites
+
+Install these on your system **before** the Python steps below:
+
+| Tool | Why it's needed | Required? |
+|---|---|---|
+| **Python 3.12** | Runs the whole app | ✅ Always |
+| **FFmpeg** | Video encoding/decoding for MoviePy | ✅ Always |
+| **ImageMagick** | Renders subtitle text onto video frames | ✅ Always |
+| **Mozilla Firefox** + a profile already logged in to YouTube/X/TikTok | Selenium uploads (the app never logs in for you) | ✅ For any upload |
+| **[Ollama](https://ollama.com)** + a pulled model (e.g. `ollama pull llama3`) | Local LLM text generation | ⚠️ Only if `llm_provider` is `ollama` |
+| **[Go](https://go.dev/dl/)** | Google Maps scraper for the outreach feature | ⚠️ Only for outreach |
+
+> macOS users: `bash scripts/setup_local.sh` auto-configures Ollama, ImageMagick, and a Firefox
+> profile. Then run `python scripts/preflight_local.py` to verify services are reachable.
 
 ## Installation
 
-> ⚠️ If you are planning to reach out to scraped businesses per E-Mail, please first install the [Go Programming Language](https://golang.org/).
-
 ```bash
-git clone https://github.com/FujiwaraChoki/MoneyPrinterV2.git
-
+# 1. Clone this fork
+git clone https://github.com/ahmadhozien/MoneyPrinterV2.git
 cd MoneyPrinterV2
-# Copy Example Configuration and fill out values in config.json
-cp config.example.json config.json
 
-# Create a virtual environment
+# 2. Copy the example config — you'll fill it in next (see Configuration below)
+cp config.example.json config.json          # Windows PowerShell: copy config.example.json config.json
+
+# 3. Create and activate a virtual environment
 python -m venv venv
+.\venv\Scripts\activate                      # Windows
+source venv/bin/activate                     # macOS / Linux
 
-# Activate the virtual environment - Windows
-.\venv\Scripts\activate
-
-# Activate the virtual environment - Unix
-source venv/bin/activate
-
-# Install the requirements
+# 4. Install Python dependencies
 pip install -r requirements.txt
 ```
 
+## Configuration
+
+All settings live in `config.json` at the project root (copied from `config.example.json`). The app
+re-reads this file on every run, so you can edit it without restarting. Key fields:
+
+**Browser (required for uploads)**
+- `firefox_profile` — absolute path to a Firefox profile already logged in to your target platforms.
+- `headless` — run the browser without a visible window.
+
+**LLM text generation** — set `llm_provider` to one of:
+- `ollama` (default, free, local) — also set `ollama_base_url` and `ollama_model` (leave `ollama_model`
+  empty to pick from installed models at startup).
+- `openai` — set `openai_api_key`, `openai_model`, and optionally `openai_base_url`.
+
+**Image / video assets** — `image_provider` + `asset_strategy` (`ai`, `stock`, or `mixed`):
+- `nanobanana2` (Gemini) — set `nanobanana2_api_key`.
+- `openai` images — set `openai_api_key` (uses `openai_image_model`).
+- `openrouter` — set `openrouter_api_key`.
+- `pixabay` stock footage — set `pixabay_api_key`.
+
+**Voiceover (TTS)** — `tts_provider`: `auto`/`kitten` (free, local) or `openai` (`openai_tts_model`, `openai_tts_voice`).
+
+**Subtitles (STT)** — `stt_provider`: `local_whisper` (free) or `third_party_assemblyai` (`assembly_ai_api_key`).
+
+**Subtitles & SFX** — `subtitle_font_english`, `subtitle_font_arabic`, `subtitle_color`,
+`sound_effects_enabled`, and the `sound_effects` keyword→clip map.
+
+**Outreach** — `email` SMTP block, `google_maps_scraper_niche`, `outreach_message_*`.
+
+**Cross-posting** — `post_bridge` block (`enabled`, `api_key`, `platforms`, `auto_crosspost`).
+
+> 🔑 **API keys** can also be supplied via environment variables instead of `config.json`:
+> `GEMINI_API_KEY`, `OPENAI_API_KEY`, `OPENROUTER_API_KEY`, `PIXABAY_API_KEY`, and
+> `POST_BRIDGE_API_KEY` are used as fallbacks when the matching config value is empty.
+> See [docs/Configuration.md](docs/Configuration.md) for the full reference.
+
 ## Usage
 
+Run the interactive CLI from the **project root** (it adds `src/` to the path):
+
 ```bash
-# Run the application
 python src/main.py
+```
+
+For headless / scheduled runs, the scheduler invokes:
+
+```bash
+python src/cron.py <platform> <account_uuid>
 ```
 
 ## GUI

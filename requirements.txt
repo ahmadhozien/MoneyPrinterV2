@@ -1,22 +1,39 @@
+# Core / CLI
 wheel
 termcolor
+art
 schedule
-streamlit
+prettytable
+platformdirs
 requests
+
+# GUI (Streamlit dashboard)
+streamlit
+
+# LLM / providers (OpenAI, OpenRouter, Gemini/Nano Banana are called over raw HTTP via `requests`)
+ollama
+
+# Text-to-speech
 kittentts @ https://github.com/KittenML/KittenTTS/releases/download/0.8.1/kittentts-0.8.1-py3-none-any.whl
 soundfile
-prettytable
-webdriver_manager
-selenium_firefox
-selenium
-ollama
+
+# Speech-to-text (subtitles)
+faster-whisper
+assemblyai
+srt_equalizer
+
+# Video / image pipeline
 moviepy
+numpy
 Pillow>=10.0.0
 arabic-reshaper
 python-bidi
-yagmail
-assemblyai
-faster-whisper
-srt_equalizer
+
+# Browser automation (Selenium)
+selenium
+selenium_firefox
+webdriver_manager
 undetected_chromedriver
-platformdirs
+
+# Outreach (email)
+yagmail
