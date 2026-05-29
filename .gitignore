@@ -12,3 +12,6 @@ auto.sh
 *.tmp
 *.tmp.*
 .claude/
+debug_run_fixcheck/
+geckodriver.log
+*.log
