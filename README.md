@@ -11,13 +11,11 @@ Sponsored by Post Bridge
 </a>
 
 
-[![madewithlove](https://img.shields.io/badge/made_with-%E2%9D%A4-red?style=for-the-badge&labelColor=orange)](https://github.com/FujiwaraChoki/MoneyPrinterV2)
+[![Based on FujiwaraChoki/MoneyPrinterV2](https://img.shields.io/badge/based_on-FujiwaraChoki%2FMoneyPrinterV2-blue?style=for-the-badge&logo=github)](https://github.com/FujiwaraChoki/MoneyPrinterV2)
 
-[![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20A%20Coffee-Donate-brightgreen?logo=buymeacoffee)](https://www.buymeacoffee.com/fujicodes)
-[![GitHub license](https://img.shields.io/github/license/FujiwaraChoki/MoneyPrinterV2?style=for-the-badge)](https://github.com/FujiwaraChoki/MoneyPrinterV2/blob/main/LICENSE)
-[![GitHub issues](https://img.shields.io/github/issues/FujiwaraChoki/MoneyPrinterV2?style=for-the-badge)](https://github.com/FujiwaraChoki/MoneyPrinterV2/issues)
-[![GitHub stars](https://img.shields.io/github/stars/FujiwaraChoki/MoneyPrinterV2?style=for-the-badge)](https://github.com/FujiwaraChoki/MoneyPrinterV2/stargazers)
-[![Discord](https://img.shields.io/discord/1134848537704804432?style=for-the-badge)](https://dsc.gg/fuji-community)
+[![GitHub license](https://img.shields.io/github/license/ahmadhozien/MoneyPrinterV2?style=for-the-badge)](https://github.com/ahmadhozien/MoneyPrinterV2/blob/main/LICENSE)
+[![GitHub issues](https://img.shields.io/github/issues/ahmadhozien/MoneyPrinterV2?style=for-the-badge)](https://github.com/ahmadhozien/MoneyPrinterV2/issues)
+[![GitHub stars](https://img.shields.io/github/stars/ahmadhozien/MoneyPrinterV2?style=for-the-badge)](https://github.com/ahmadhozien/MoneyPrinterV2/stargazers)
 
 An Application that automates the process of making money online.
 MPV2 (MoneyPrinter Version 2) is, as the name suggests, the second version of the MoneyPrinter project. It is a complete rewrite of the original project, with a focus on a wider range of features and a more modular architecture.
