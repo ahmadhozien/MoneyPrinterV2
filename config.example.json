@@ -179,5 +179,12 @@
     "مفاجأة": "notification.wav",
     "رعب": "suspense.wav",
     "الحقيقة": "reveal.wav"
+  },
+  "post_bridge": {
+    "enabled": false,
+    "api_key": "",
+    "platforms": ["tiktok", "instagram"],
+    "account_ids": [],
+    "auto_crosspost": false
   }
 }
