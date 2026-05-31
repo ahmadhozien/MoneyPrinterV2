@@ -949,3 +949,107 @@ def get_post_bridge_config() -> dict:
             raw_config.get("auto_crosspost", defaults["auto_crosspost"])
         ),
     }
+
+def _read_config() -> dict:
+    """
+    Reads and returns the raw config.json contents.
+
+    Returns:
+        config_json (dict): parsed config, or empty dict on failure
+    """
+    try:
+        with open(os.path.join(ROOT_DIR, "config.json"), "r", encoding="utf-8") as file:
+            data = json.load(file)
+            return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+def get_llm_max_retries() -> int:
+    """
+    Maximum number of times an LLM call may be retried when it returns
+    malformed/empty output. Bounds worst-case token usage on flaky models.
+
+    Returns:
+        retries (int): retry cap (>= 0), default 2
+    """
+    value = _read_config().get("llm_max_retries", 2)
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return 2
+
+def get_llm_prompt_caching_enabled() -> bool:
+    """
+    Whether to route static instruction prefixes through the provider's
+    prompt-cache path (OpenAI `instructions` + `prompt_cache_key`).
+
+    Returns:
+        enabled (bool): default True
+    """
+    return bool(_read_config().get("llm_prompt_caching_enabled", True))
+
+def get_llm_max_output_tokens() -> dict:
+    """
+    Per-call output-token caps. Keeps short generations (topic, title, etc.)
+    from running long and wasting tokens. Empty/0 means "no cap".
+
+    Returns:
+        caps (dict): call-kind -> max output tokens
+    """
+    defaults = {
+        "topic": 80,
+        "script": 700,
+        "metadata": 500,
+        "prompts": 900,
+        "combined": 1200,
+        "translate": 700,
+        "stock_query": 700,
+    }
+    raw = _read_config().get("llm_max_output_tokens", {})
+    if isinstance(raw, dict):
+        for key, value in raw.items():
+            try:
+                defaults[str(key)] = max(0, int(value))
+            except (TypeError, ValueError):
+                continue
+    return defaults
+
+def get_youtube_combine_metadata_and_prompts() -> bool:
+    """
+    When True, metadata (title/description/tags) and image prompts are produced
+    in a single LLM call instead of two, saving one full-script round trip.
+
+    Returns:
+        enabled (bool): default True
+    """
+    return bool(_read_config().get("youtube_combine_metadata_and_prompts", True))
+
+def get_youtube_send_full_script_to_prompts() -> bool:
+    """
+    When True, the full script is embedded in the image-prompt call for extra
+    context. When False, only the per-scene beats are sent (fewer input tokens).
+
+    Returns:
+        enabled (bool): default False
+    """
+    return bool(_read_config().get("youtube_send_full_script_to_prompts", False))
+
+def get_youtube_template_topic() -> bool:
+    """
+    When True, the video topic is templated from the niche locally instead of
+    calling the LLM to generate it.
+
+    Returns:
+        enabled (bool): default False
+    """
+    return bool(_read_config().get("youtube_template_topic", False))
+
+def get_youtube_local_tags() -> bool:
+    """
+    When True, hashtags/tags are derived locally from the script/subject
+    instead of relying solely on the LLM metadata response.
+
+    Returns:
+        enabled (bool): default True
+    """
+    return bool(_read_config().get("youtube_local_tags", True))

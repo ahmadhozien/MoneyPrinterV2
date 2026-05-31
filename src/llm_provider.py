@@ -223,6 +223,9 @@ def generate_text(
     prompt: str,
     model_name: str = None,
     provider: str | None = None,
+    instructions: str | None = None,
+    max_tokens: int | None = None,
+    cache_key: str | None = None,
 ) -> str:
     """
     Generates text using the configured LLM provider.
@@ -231,6 +234,11 @@ def generate_text(
         prompt (str): user prompt
         model_name (str): optional model override
         provider (str | None): optional provider override
+        instructions (str | None): static system-level instructions. Sent
+            separately from the dynamic prompt so providers can cache the
+            (large, repeated) prefix across calls.
+        max_tokens (int | None): cap on generated output tokens
+        cache_key (str | None): stable key to improve prompt-cache routing
 
     Returns:
         response (str): generated text
@@ -239,6 +247,9 @@ def generate_text(
         prompt,
         model_name=model_name,
         provider=provider,
+        instructions=instructions,
+        max_tokens=max_tokens,
+        cache_key=cache_key,
     )["text"]
 
 
@@ -246,6 +257,9 @@ def generate_text_result(
     prompt: str,
     model_name: str = None,
     provider: str | None = None,
+    instructions: str | None = None,
+    max_tokens: int | None = None,
+    cache_key: str | None = None,
 ) -> dict:
     """
     Generates text and returns normalized usage metadata for pricing/reporting.
@@ -254,6 +268,9 @@ def generate_text_result(
         prompt (str): user prompt
         model_name (str): optional model override
         provider (str | None): optional provider override
+        instructions (str | None): static system-level instructions (cacheable)
+        max_tokens (int | None): cap on generated output tokens
+        cache_key (str | None): stable key to improve prompt-cache routing
 
     Returns:
         result (dict): provider, model, text, usage
@@ -265,15 +282,26 @@ def generate_text_result(
             "No model selected. Set a configured model, call select_model(), or pass model_name."
         )
 
+    normalized_instructions = (instructions or "").strip()
+    try:
+        normalized_max_tokens = int(max_tokens) if max_tokens else 0
+    except (TypeError, ValueError):
+        normalized_max_tokens = 0
+
     if resolved_provider == "openai":
-        response = _openai_request(
-            "POST",
-            "responses",
-            {
-                "model": model,
-                "input": prompt,
-            },
-        )
+        payload = {
+            "model": model,
+            "input": prompt,
+        }
+        if normalized_instructions:
+            payload["instructions"] = normalized_instructions
+        if normalized_max_tokens > 0:
+            payload["max_output_tokens"] = normalized_max_tokens
+        if cache_key:
+            # Improves cache hit-rate routing for repeated instruction prefixes.
+            payload["prompt_cache_key"] = str(cache_key)
+
+        response = _openai_request("POST", "responses", payload)
         return {
             "provider": resolved_provider,
             "model": model,
@@ -281,10 +309,16 @@ def generate_text_result(
             "usage": _extract_openai_usage(response),
         }
 
-    response = _ollama_client().chat(
-        model=model,
-        messages=[{"role": "user", "content": prompt}],
-    )
+    messages = []
+    if normalized_instructions:
+        messages.append({"role": "system", "content": normalized_instructions})
+    messages.append({"role": "user", "content": prompt})
+
+    chat_kwargs = {"model": model, "messages": messages}
+    if normalized_max_tokens > 0:
+        chat_kwargs["options"] = {"num_predict": normalized_max_tokens}
+
+    response = _ollama_client().chat(**chat_kwargs)
 
     return {
         "provider": resolved_provider,

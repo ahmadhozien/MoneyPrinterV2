@@ -160,3 +160,18 @@ export POST_BRIDGE_API_KEY="your_post_bridge_api_key_here"
 ```
 
 See [PostBridge.md](./PostBridge.md) for the full Post Bridge setup and behavior details.
+
+## Token usage controls (LLM cost)
+
+These keys reduce text-LLM token usage during video generation — most relevant when
+`llm_provider` is `openai` (paid). All are optional with the defaults shown.
+
+| Key | Default | Effect |
+|---|---|---|
+| `llm_max_retries` | `2` | Caps retries on malformed/empty LLM output (prevents runaway token usage on flaky models). |
+| `llm_prompt_caching_enabled` | `true` | Sends static instruction prefixes via the provider's cache path (`instructions` + `prompt_cache_key` on OpenAI) so repeated prefixes are billed at the cached rate. |
+| `llm_max_output_tokens` | per-call map | Caps output tokens per call kind (`topic`, `script`, `metadata`, `prompts`, `combined`, `translate`, `stock_query`). Set a value to `0` to disable that cap. |
+| `youtube_combine_metadata_and_prompts` | `true` | Generates metadata **and** image prompts in a single LLM call instead of two, eliminating a duplicate full-script round trip. Falls back to two calls automatically if the combined response can't be parsed. |
+| `youtube_send_full_script_to_prompts` | `false` | When `false`, only the per-scene beats are sent to the image-prompt call (fewer input tokens). Set `true` to also embed the full script for extra context. |
+| `youtube_template_topic` | `false` | When `true`, the topic is templated from the niche locally instead of via an LLM call. |
+| `youtube_local_tags` | `true` | Derives tags/hashtags locally from the script when the model omits them, avoiding extra LLM calls. |

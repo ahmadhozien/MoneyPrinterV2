@@ -159,6 +159,7 @@ class YouTube:
         self.images = []
         self.visual_assets = []
         self.scene_units = []
+        self._combined_meta_prompts = None
         self._cost_items = []
         self._cost_notes = []
         self._pixabay_selection_debug = []
@@ -278,17 +279,34 @@ class YouTube:
         except Exception:
             pass
 
-    def generate_response(self, prompt: str, model_name: str = None) -> str:
+    def generate_response(
+        self,
+        prompt: str,
+        model_name: str = None,
+        instructions: str | None = None,
+        max_tokens: int | None = None,
+        cache_key: str | None = None,
+    ) -> str:
         """
         Generates an LLM Response based on a prompt and the user-provided model.
 
         Args:
             prompt (str): The prompt to use in the text generation.
+            model_name (str): optional model override
+            instructions (str | None): static, cacheable system instructions
+            max_tokens (int | None): cap on generated output tokens
+            cache_key (str | None): stable prompt-cache routing key
 
         Returns:
             response (str): The generated AI Repsonse.
         """
-        result = generate_text_result(prompt, model_name=model_name)
+        result = generate_text_result(
+            prompt,
+            model_name=model_name,
+            instructions=instructions,
+            max_tokens=max_tokens,
+            cache_key=cache_key,
+        )
         self._record_text_generation_cost(
             provider=result.get("provider", get_llm_provider()),
             model=result.get("model", model_name or get_configured_llm_model()),
@@ -301,6 +319,9 @@ class YouTube:
         prompt: str,
         model_name: str = None,
         provider: str | None = None,
+        instructions: str | None = None,
+        max_tokens: int | None = None,
+        cache_key: str | None = None,
     ) -> str:
         """
         Generates an LLM response with an explicit provider override.
@@ -309,17 +330,45 @@ class YouTube:
             prompt (str): text-generation prompt
             model_name (str | None): optional model override
             provider (str | None): provider override
+            instructions (str | None): static, cacheable system instructions
+            max_tokens (int | None): cap on generated output tokens
+            cache_key (str | None): stable prompt-cache routing key
 
         Returns:
             response (str): generated text
         """
-        result = generate_text_result(prompt, model_name=model_name, provider=provider)
+        result = generate_text_result(
+            prompt,
+            model_name=model_name,
+            provider=provider,
+            instructions=instructions,
+            max_tokens=max_tokens,
+            cache_key=cache_key,
+        )
         self._record_text_generation_cost(
             provider=result.get("provider", provider or get_llm_provider()),
             model=result.get("model", model_name or get_configured_llm_model()),
             usage=result.get("usage", {}),
         )
         return result["text"]
+
+    def _llm_options(self, kind: str) -> dict:
+        """
+        Returns shared generation options (output-token cap + prompt-cache key)
+        for a given call kind, so token controls stay consistent across calls.
+
+        Args:
+            kind (str): logical call kind (e.g. "script", "prompts", "metadata")
+
+        Returns:
+            options (dict): kwargs to splat into generate_response(...)
+        """
+        caps = get_llm_max_output_tokens()
+        cache_enabled = get_llm_prompt_caching_enabled()
+        return {
+            "max_tokens": caps.get(kind) or None,
+            "cache_key": f"yt-{kind}" if cache_enabled else None,
+        }
 
     def _get_pricing_currency(self) -> str:
         """
@@ -1018,6 +1067,19 @@ class YouTube:
             "Keep the pacing tight and concise enough to stay around that runtime.\n"
         )
 
+    def _template_topic_from_niche(self) -> str:
+        """
+        Builds a topic line from the channel niche without an LLM call.
+
+        Returns:
+            topic (str): a single-sentence topic derived from the niche
+        """
+        niche = re.sub(r"\s+", " ", str(self.niche or "").strip())
+        if not niche:
+            return ""
+        # Reuse the niche as a concise, specific topic sentence.
+        return niche if niche.endswith((".", "!", "?")) else f"{niche}."
+
     def generate_topic(self) -> str:
         """
         Generates a topic based on the YouTube Channel niche.
@@ -1025,12 +1087,17 @@ class YouTube:
         Returns:
             topic (str): The generated topic.
         """
-        completion = self.generate_response(
-            f"{self._get_character_context_block()}"
-            f"{self._get_locale_block()}"
-            f"Please generate a specific video idea that takes about the following topic: {self.niche}. "
-            "Make it exactly one sentence. Only return the topic, nothing else."
-        )
+        if get_youtube_template_topic():
+            # Skip the LLM entirely: derive a topic from the niche locally.
+            completion = self._template_topic_from_niche()
+        else:
+            completion = self.generate_response(
+                f"{self._get_character_context_block()}"
+                f"{self._get_locale_block()}"
+                f"Please generate a specific video idea that takes about the following topic: {self.niche}. "
+                "Make it exactly one sentence. Only return the topic, nothing else.",
+                **self._llm_options("topic"),
+            )
 
         if not completion:
             error("Failed to generate Topic.")
@@ -1053,46 +1120,58 @@ class YouTube:
             script (str): The script of the video.
         """
         sentence_length = get_script_sentence_length()
-        prompt = f"""
-        Generate a script for a video in {sentence_length} sentences, depending on the subject of the video.
+        # Static rules go in `instructions` so the provider can cache this large
+        # prefix across videos; only the per-video subject/locale is dynamic.
+        instructions = (
+            "You are a short-form video scriptwriter. Follow every rule exactly:\n"
+            f"- Write the script in exactly {sentence_length} short sentences.\n"
+            "- Get straight to the point; never open with filler like 'welcome to this video'.\n"
+            "- No markdown, no formatting, and never use a title.\n"
+            "- Do not include 'voiceover', 'narrator', or any speaker labels.\n"
+            "- Never mention this prompt, the script itself, or the number of sentences/paragraphs.\n"
+            "- Write in the language and dialect given in the request.\n"
+            "- Return only the raw script text."
+        )
+        prompt = (
+            f"{self._get_character_context_block()}"
+            f"{self._get_locale_block()}"
+            f"{self._get_target_duration_block()}"
+            f"Subject: {self.subject}"
+        )
 
-        The script is to be returned as a string with the specified number of paragraphs.
+        completion = ""
+        for attempt in range(get_llm_max_retries() + 1):
+            completion = re.sub(
+                r"\*",
+                "",
+                self.generate_response(
+                    prompt,
+                    instructions=instructions,
+                    **self._llm_options("script"),
+                )
+                or "",
+            ).strip()
 
-        Here is an example of a string:
-        "This is an example string."
+            if completion and len(completion) <= 5000:
+                break
 
-        Do not under any circumstance reference this prompt in your response.
-
-        Get straight to the point, don't start with unnecessary things like, "welcome to this video".
-
-        Obviously, the script should be related to the subject of the video.
-        
-        YOU MUST NOT EXCEED THE {sentence_length} SENTENCES LIMIT. MAKE SURE THE {sentence_length} SENTENCES ARE SHORT.
-        YOU MUST NOT INCLUDE ANY TYPE OF MARKDOWN OR FORMATTING IN THE SCRIPT, NEVER USE A TITLE.
-        YOU MUST WRITE THE SCRIPT IN THE LANGUAGE AND DIALECT SPECIFIED BELOW.
-        ONLY RETURN THE RAW CONTENT OF THE SCRIPT. DO NOT INCLUDE "VOICEOVER", "NARRATOR" OR SIMILAR INDICATORS OF WHAT SHOULD BE SPOKEN AT THE BEGINNING OF EACH PARAGRAPH OR LINE. YOU MUST NOT MENTION THE PROMPT, OR ANYTHING ABOUT THE SCRIPT ITSELF. ALSO, NEVER TALK ABOUT THE AMOUNT OF PARAGRAPHS OR LINES. JUST WRITE THE SCRIPT
-        {self._get_character_context_block()}
-        {self._get_locale_block()}
-        {self._get_target_duration_block()}
-        
-        Subject: {self.subject}
-        """
-        completion = self.generate_response(prompt)
-
-        # Apply regex to remove *
-        completion = re.sub(r"\*", "", completion)
+            if get_verbose():
+                warning(
+                    "Generated script was empty or too long. "
+                    f"Retrying ({attempt + 1}/{get_llm_max_retries()})..."
+                )
 
         if not completion:
             error("The generated script is empty.")
             return
 
         if len(completion) > 5000:
-            if get_verbose():
-                warning("Generated Script is too long. Retrying...")
-            return self.generate_script()
+            # Last resort after exhausting retries: truncate rather than loop.
+            completion = completion[:5000].rstrip()
 
         self.script = completion
         self.scene_units = []
+        self._combined_meta_prompts = None
         self._emit_progress(
             "script",
             "Generated narration script.",
@@ -1136,6 +1215,7 @@ class YouTube:
         self.subject = cleaned_subject or self._derive_subject_from_script(cleaned_script)
         self.script = cleaned_script
         self.scene_units = []
+        self._combined_meta_prompts = None
         self._emit_progress(
             "topic",
             "Using provided video subject.",
@@ -1276,72 +1356,97 @@ class YouTube:
 
         return self._write_workspace_state()
 
-    def generate_metadata(self) -> dict:
+    def _parse_json_lenient(self, completion: str):
         """
-        Generates SEO metadata for the to-be-uploaded YouTube Short.
+        Parses a JSON object/array from an LLM completion, tolerating code
+        fences and surrounding prose.
+
+        Args:
+            completion (str): raw model output
 
         Returns:
-            metadata (dict): The generated metadata.
+            parsed: decoded JSON value, or None if nothing valid was found
         """
-        prompt = f"""
-        Generate YouTube Shorts metadata as a JSON object.
-        {self._get_character_context_block()}
-        {self._get_locale_block()}
-
-        Subject: {self.subject}
-        Script: {self.script}
-
-        Return ONLY valid JSON with these keys:
-        - "title": a natural, clickable title under 80 characters. No markdown.
-        - "description": 2 short lines that match the video and encourage engagement.
-        - "hashtags": an array of 3 short relevant hashtags without explanations.
-        - "tags": an array of 8 short search-friendly tags/keywords relevant to YouTube discoverability.
-
-        Rules:
-        - Keep everything aligned with the video's niche, audience, and character context.
-        - Use the requested language and dialect naturally.
-        - Avoid spammy clickbait, keyword stuffing, or repetitive hashtags.
-        - Do not include any text outside the JSON object.
-        """
-
-        completion = (
-            str(self.generate_response(prompt, model_name=self._get_metadata_model_name()))
-            .replace("```json", "")
-            .replace("```", "")
-            .strip()
-        )
-
+        cleaned = str(completion or "").replace("```json", "").replace("```", "").strip()
+        if not cleaned:
+            return None
         try:
-            metadata = json.loads(completion)
-        except json.JSONDecodeError:
-            if get_verbose():
-                warning("Metadata response was not valid JSON. Falling back to simpler metadata generation.")
+            return json.loads(cleaned)
+        except Exception:
+            pass
+        for pattern in (r"\{.*\}", r"\[.*\]"):
+            match = re.search(pattern, cleaned, re.DOTALL)
+            if match:
+                try:
+                    return json.loads(match.group(0))
+                except Exception:
+                    continue
+        return None
 
-            title = self.generate_response(
-                f"{self._get_character_context_block()}{self._get_locale_block()}"
-                f"Generate one YouTube Shorts title under 80 characters for this subject: {self.subject}. "
-                "Return only the title.",
-                model_name=self._get_metadata_model_name(),
-            ).strip()
-            description = self.generate_response(
-                f"{self._get_character_context_block()}{self._get_locale_block()}"
-                f"Generate a short YouTube Shorts description for this script: {self.script}. "
-                "Return only the description.",
-                model_name=self._get_metadata_model_name(),
-            ).strip()
-            metadata = {
-                "title": title,
-                "description": description,
-                "hashtags": [],
-                "tags": [],
-            }
+    def _coerce_prompt_list(self, parsed) -> list:
+        """
+        Normalizes a parsed JSON value into a flat list of prompt strings.
 
+        Args:
+            parsed: decoded JSON (list, dict with "image_prompts", or nested)
+
+        Returns:
+            prompts (list): list of prompt strings (possibly empty)
+        """
+        if isinstance(parsed, dict) and "image_prompts" in parsed:
+            parsed = parsed["image_prompts"]
+        if isinstance(parsed, list) and len(parsed) == 1 and isinstance(parsed[0], str):
+            try:
+                inner = json.loads(parsed[0])
+                if isinstance(inner, list):
+                    parsed = inner
+            except Exception:
+                pass
+        return parsed if isinstance(parsed, list) else []
+
+    def _derive_local_tags_and_hashtags(self) -> tuple:
+        """
+        Derives tags/hashtags from the subject and script locally, avoiding an
+        extra LLM call when the model omits them.
+
+        Returns:
+            (tags, hashtags) (tuple[list, list])
+        """
+        text = f"{self.subject} {self.script}".lower()
+        words = re.findall(r"[a-z؀-ۿ][a-z0-9؀-ۿ]{2,}", text)
+        stop = {
+            "the", "and", "for", "with", "this", "that", "you", "your", "are",
+            "was", "were", "has", "have", "but", "not", "from", "they", "their",
+            "what", "when", "then", "there", "about", "into", "just", "like",
+            "will", "can", "all", "out", "one", "now", "how", "why", "who",
+            "while", "where", "which", "been", "more", "over", "after",
+            "before", "them", "its", "his", "her", "she", "him",
+        }
+        ordered = []
+        for word in words:
+            if word in stop or word in ordered:
+                continue
+            ordered.append(word)
+            if len(ordered) >= 8:
+                break
+        return ordered, ordered[:3]
+
+    def _finalize_metadata(self, metadata: dict) -> dict:
+        """
+        Cleans, validates, and stores generated metadata fields.
+
+        Args:
+            metadata (dict): raw metadata mapping from the LLM
+
+        Returns:
+            metadata (dict): stored, normalized metadata
+        """
         title = str(metadata.get("title", "")).strip()
         description = str(metadata.get("description", "")).strip()
+
         raw_hashtags = metadata.get("hashtags", [])
         if isinstance(raw_hashtags, str):
             raw_hashtags = re.split(r"[,#\n]+", raw_hashtags)
-
         raw_tags = metadata.get("tags", [])
         if isinstance(raw_tags, str):
             raw_tags = re.split(r"[,|\n]+", raw_tags)
@@ -1356,6 +1461,13 @@ class YouTube:
             for item in raw_tags
             if str(item).strip()
         ][:8]
+
+        if get_youtube_local_tags() and (not tags or not hashtags):
+            local_tags, local_hashtags = self._derive_local_tags_and_hashtags()
+            if not tags:
+                tags = local_tags
+            if not hashtags:
+                hashtags = local_hashtags
 
         if not title:
             raise RuntimeError("Metadata generation did not return a title.")
@@ -1382,8 +1494,249 @@ class YouTube:
             {"metadata": self.metadata},
         )
         self._write_workspace_state()
-
         return self.metadata
+
+    def _finalize_image_prompts(self, raw_prompts: list, scene_units: list) -> list:
+        """
+        Cleans, translates (if needed), and fits raw prompts to the scene count.
+
+        Args:
+            raw_prompts (list): raw prompt strings from the LLM
+            scene_units (list): ordered scene beats
+
+        Returns:
+            image_prompts (list): finalized prompts (empty if none usable)
+        """
+        n_prompts = len(scene_units)
+
+        image_prompts = [
+            self._make_provider_friendly_image_prompt(prompt)
+            for prompt in raw_prompts
+            if isinstance(prompt, str) and prompt.strip()
+        ]
+
+        if self._image_prompts_need_translation(image_prompts):
+            image_prompts = [
+                self._make_provider_friendly_image_prompt(prompt)
+                for prompt in self._translate_image_prompts_to_english(image_prompts)
+                if isinstance(prompt, str) and prompt.strip()
+            ]
+
+        if not image_prompts:
+            return []
+
+        if len(image_prompts) > n_prompts:
+            image_prompts = image_prompts[:n_prompts]
+        if len(image_prompts) < n_prompts:
+            image_prompts.extend(image_prompts[-1:] * (n_prompts - len(image_prompts)))
+
+        return image_prompts
+
+    def _store_image_prompts(self, image_prompts: list, scene_units: list) -> list:
+        """
+        Persists finalized image prompts and emits progress.
+
+        Args:
+            image_prompts (list): finalized prompts
+            scene_units (list): ordered scene beats
+
+        Returns:
+            image_prompts (list): the stored prompts
+        """
+        self.image_prompts = image_prompts
+        self.scene_units = scene_units
+
+        success(f"Generated {len(image_prompts)} Image Prompts.")
+        self._emit_progress(
+            "image_prompts",
+            f"Generated {len(image_prompts)} image prompts.",
+            {"image_prompts": image_prompts},
+        )
+        self._write_workspace_state()
+        return image_prompts
+
+    def _metadata_instructions(self) -> str:
+        """Static, cacheable instruction prefix for standalone metadata."""
+        return (
+            "You generate YouTube Shorts SEO metadata as a single JSON object. "
+            "Return ONLY valid JSON (no markdown fences) with keys: "
+            '"title" (natural, clickable, under 80 characters, no markdown), '
+            '"description" (2 short engaging lines), '
+            '"hashtags" (array of 3 short relevant hashtags, no explanations), '
+            '"tags" (array of 8 short search-friendly keywords). '
+            "Align everything with the niche, audience, character context, language, and dialect. "
+            "Avoid spammy clickbait or keyword stuffing. No text outside the JSON object."
+        )
+
+    def _prompts_instructions(self) -> str:
+        """Static, cacheable instruction prefix for standalone image prompts."""
+        return (
+            "You create still-image prompts for a short narrated video; each image illustrates "
+            "exactly what the narrator says at that beat. Return ONLY a JSON array of strings "
+            "(no markdown, no numbering, no explanation). Each prompt: 8-18 words, English only, "
+            "concrete who/what/where/doing-what, cinematic and photorealistic, depicting the SPECIFIC "
+            "action/object/emotion of its beat (not a generic topic image). No readable "
+            "text/captions/logos/watermarks/UI, no repeated scenes, no abstract metaphors. "
+            "Output exactly one prompt per scene beat, in order."
+        )
+
+    def _combined_instructions(self) -> str:
+        """Static, cacheable instruction prefix for the combined metadata+prompts call."""
+        return (
+            "You produce all text assets for a YouTube Short as a single JSON object. "
+            "Return ONLY valid JSON (no markdown fences) with keys: "
+            '"title" (natural, clickable, under 80 characters, no markdown), '
+            '"description" (2 short engaging lines), '
+            '"hashtags" (array of 3 short hashtags), '
+            '"tags" (array of 8 short search-friendly keywords), '
+            '"image_prompts" (array of still-image prompts, one per scene beat, in order). '
+            "Each image prompt: 8-18 words, English only, concrete who/what/where/doing-what, "
+            "cinematic and photorealistic, depicting the SPECIFIC action/object/emotion of its beat "
+            "(not a generic topic image); no readable text/logos/watermarks/UI, no repeats, no "
+            "abstract metaphors. Align title/description/tags with the niche, audience, character "
+            "context, language, and dialect. No spammy clickbait. No text outside the JSON object."
+        )
+
+    def _generate_combined_meta_prompts(self, scene_units: list):
+        """
+        Produces metadata and image prompts in ONE LLM call.
+
+        Args:
+            scene_units (list): ordered scene beats
+
+        Returns:
+            (metadata, prompts) (tuple[dict | None, list]): parsed metadata and
+            raw prompt list, or (None, []) if the call could not be parsed.
+        """
+        n_prompts = len(scene_units)
+        script_block = (
+            f"FULL SCRIPT (for context):\n{self.script}\n\n"
+            if get_youtube_send_full_script_to_prompts()
+            else ""
+        )
+        prompt = (
+            f"{self._get_character_context_block()}"
+            f"{self._get_locale_block()}"
+            f"{self._get_visual_locale_prompt_block()}"
+            f"Subject: {self.subject}\n\n"
+            f"{script_block}"
+            f"Produce exactly {n_prompts} image_prompts, one per scene beat below "
+            f"(image_prompts[i] must match beat[i]).\n"
+            f"Scene beats in order:\n{json.dumps(scene_units, ensure_ascii=False)}"
+        )
+
+        for attempt in range(get_llm_max_retries() + 1):
+            parsed = self._parse_json_lenient(
+                self.generate_response(
+                    prompt,
+                    instructions=self._combined_instructions(),
+                    **self._llm_options("combined"),
+                )
+            )
+            if isinstance(parsed, dict):
+                prompts = self._coerce_prompt_list(parsed.get("image_prompts", []))
+                if str(parsed.get("title", "")).strip() and prompts:
+                    return parsed, prompts
+            if get_verbose():
+                warning(
+                    "Combined metadata+prompts response was malformed. "
+                    f"Retrying ({attempt + 1}/{get_llm_max_retries()})..."
+                )
+        return None, []
+
+    def _ensure_combined_meta_prompts(self):
+        """
+        Runs (and caches) the combined metadata+prompts call once per script,
+        so generate_metadata() and generate_prompts() share a single request.
+
+        Returns:
+            combined (dict | None): cached combined result, or None to fall back
+        """
+        if not get_youtube_combine_metadata_and_prompts():
+            return None
+
+        cached = getattr(self, "_combined_meta_prompts", None)
+        if cached is not None:
+            return cached or None  # empty dict => previously failed, don't retry
+
+        scene_units = self._get_scene_units()
+        if not scene_units:
+            return None
+
+        parsed, prompts = self._generate_combined_meta_prompts(scene_units)
+        if parsed is None or not prompts:
+            self._combined_meta_prompts = {}  # mark as attempted-and-failed
+            return None
+
+        parsed["_image_prompts"] = prompts
+        parsed["_scene_units"] = scene_units
+        self._combined_meta_prompts = parsed
+        return parsed
+
+    def generate_metadata(self) -> dict:
+        """
+        Generates SEO metadata for the to-be-uploaded YouTube Short.
+
+        Returns:
+            metadata (dict): The generated metadata.
+        """
+        combined = self._ensure_combined_meta_prompts()
+        if combined is not None:
+            return self._finalize_metadata(combined)
+
+        # Standalone path (combine disabled or unavailable).
+        prompt = (
+            f"{self._get_character_context_block()}"
+            f"{self._get_locale_block()}"
+            f"Subject: {self.subject}\n"
+            f"Script: {self.script}"
+        )
+
+        metadata = None
+        for attempt in range(get_llm_max_retries() + 1):
+            parsed = self._parse_json_lenient(
+                self.generate_response(
+                    prompt,
+                    model_name=self._get_metadata_model_name(),
+                    instructions=self._metadata_instructions(),
+                    **self._llm_options("metadata"),
+                )
+            )
+            if isinstance(parsed, dict) and str(parsed.get("title", "")).strip():
+                metadata = parsed
+                break
+            if get_verbose():
+                warning(
+                    "Metadata response was not valid JSON. "
+                    f"Retrying ({attempt + 1}/{get_llm_max_retries()})..."
+                )
+
+        if metadata is None:
+            # Cheap fallback: two tiny calls for title + description only.
+            if get_verbose():
+                warning("Falling back to simpler metadata generation.")
+            title = self.generate_response(
+                f"{self._get_character_context_block()}{self._get_locale_block()}"
+                f"Generate one YouTube Shorts title under 80 characters for this subject: {self.subject}. "
+                "Return only the title.",
+                model_name=self._get_metadata_model_name(),
+                max_tokens=self._llm_options("topic").get("max_tokens"),
+            ).strip()
+            description = self.generate_response(
+                f"{self._get_character_context_block()}{self._get_locale_block()}"
+                f"Generate a short YouTube Shorts description for this script: {self.script}. "
+                "Return only the description.",
+                model_name=self._get_metadata_model_name(),
+                **self._llm_options("metadata"),
+            ).strip()
+            metadata = {
+                "title": title,
+                "description": description,
+                "hashtags": [],
+                "tags": [],
+            }
+
+        return self._finalize_metadata(metadata)
 
     def generate_prompts(self) -> List[str]:
         """
@@ -1396,112 +1749,58 @@ class YouTube:
         if not scene_units:
             raise RuntimeError("Could not derive scene units from the current script.")
 
+        # Reuse the combined call's prompts when available (single request).
+        combined = self._ensure_combined_meta_prompts()
+        if combined is not None and combined.get("_image_prompts"):
+            combined_units = combined.get("_scene_units", scene_units)
+            image_prompts = self._finalize_image_prompts(
+                combined["_image_prompts"], combined_units
+            )
+            if image_prompts:
+                return self._store_image_prompts(image_prompts, combined_units)
+
+        # Standalone path.
         n_prompts = len(scene_units)
-
-        prompt = f"""
-        You are creating image prompts for a short video. The voiceover script is read aloud
-        while images are shown on screen. Each image MUST visually illustrate exactly what the
-        narrator is saying at that moment.
-
-        Subject: {self.subject}
-        {self._get_character_context_block()}
-        {self._get_visual_locale_prompt_block()}
-
-        FULL SCRIPT (for context — understand the story before generating prompts):
-        {self.script}
-
-        Now generate exactly {n_prompts} image prompts, one for each scene beat below.
-        Each prompt must depict the SPECIFIC action, object, or emotion described in its
-        corresponding scene beat — NOT a generic image about the overall topic.
-
-        Rules:
-        - Each prompt is a concise still-image description (8-18 words).
-        - Write all prompts in clear English, even if the script is in another language.
-        - Each prompt must directly visualize what the narrator says in THAT specific beat.
-        - Include concrete visual details: who, what, where, doing what.
-        - Use cinematic, emotional, photorealistic descriptions.
-        - Avoid readable text, captions, logos, watermarks, or UI elements.
-        - Do NOT repeat the same scene across multiple prompts.
-        - Do NOT use abstract or metaphorical imagery — depict the literal scene.
-
-        Return ONLY a JSON array of strings. No numbering, no explanation.
-        Example: ["prompt 1", "prompt 2", "prompt 3"]
-
-        Scene beats in order (prompt[i] must match beat[i]):
-        {json.dumps(scene_units, ensure_ascii=False)}
-        """
-
-        completion = (
-            str(self.generate_response(prompt))
-            .replace("```json", "")
-            .replace("```", "")
+        script_block = (
+            f"FULL SCRIPT (for context — understand the story before generating prompts):\n{self.script}\n\n"
+            if get_youtube_send_full_script_to_prompts()
+            else ""
+        )
+        prompt = (
+            f"{self._get_character_context_block()}"
+            f"{self._get_visual_locale_prompt_block()}"
+            f"Subject: {self.subject}\n\n"
+            f"{script_block}"
+            f"Generate exactly {n_prompts} image prompts, one per scene beat below "
+            f"(prompt[i] must match beat[i]).\n"
+            f"Scene beats in order:\n{json.dumps(scene_units, ensure_ascii=False)}"
         )
 
         image_prompts = []
-
-        if "image_prompts" in completion:
-            image_prompts = json.loads(completion)["image_prompts"]
-        else:
-            try:
-                image_prompts = json.loads(completion)
-                if get_verbose():
-                    info(f" => Generated Image Prompts: {image_prompts}")
-            except Exception:
-                if get_verbose():
-                    warning(
-                        "LLM returned an unformatted response. Attempting to clean..."
-                    )
-
-                # Get everything between [ and ], and turn it into a list
-                r = re.compile(r"\[.*\]")
-                image_prompts = r.findall(completion)
-                if len(image_prompts) == 0:
-                    if get_verbose():
-                        warning("Failed to generate Image Prompts. Retrying...")
-                    return self.generate_prompts()
-
-        if len(image_prompts) == 1 and isinstance(image_prompts[0], str):
-            try:
-                image_prompts = json.loads(image_prompts[0])
-            except Exception:
-                pass
-
-        image_prompts = [
-            self._make_provider_friendly_image_prompt(prompt)
-            for prompt in image_prompts
-            if isinstance(prompt, str) and prompt.strip()
-        ]
-
-        if self._image_prompts_need_translation(image_prompts):
-            image_prompts = [
-                self._make_provider_friendly_image_prompt(prompt)
-                for prompt in self._translate_image_prompts_to_english(image_prompts)
-                if isinstance(prompt, str) and prompt.strip()
-            ]
-
-        if len(image_prompts) == 0:
+        for attempt in range(get_llm_max_retries() + 1):
+            parsed = self._parse_json_lenient(
+                self.generate_response(
+                    prompt,
+                    instructions=self._prompts_instructions(),
+                    **self._llm_options("prompts"),
+                )
+            )
+            image_prompts = self._finalize_image_prompts(
+                self._coerce_prompt_list(parsed if parsed is not None else []),
+                scene_units,
+            )
+            if image_prompts:
+                break
             if get_verbose():
-                warning("No usable image prompts returned. Retrying...")
-            return self.generate_prompts()
+                warning(
+                    "No usable image prompts returned. "
+                    f"Retrying ({attempt + 1}/{get_llm_max_retries()})..."
+                )
 
-        if len(image_prompts) > n_prompts:
-            image_prompts = image_prompts[:n_prompts]
+        if not image_prompts:
+            raise RuntimeError("Failed to generate usable image prompts after retries.")
 
-        if len(image_prompts) < n_prompts:
-            image_prompts.extend(image_prompts[-1:] * (n_prompts - len(image_prompts)))
-
-        self.image_prompts = image_prompts
-        self.scene_units = scene_units
-
-        success(f"Generated {len(image_prompts)} Image Prompts.")
-        self._emit_progress(
-            "image_prompts",
-            f"Generated {len(image_prompts)} image prompts.",
-            {"image_prompts": image_prompts},
-        )
-        self._write_workspace_state()
-
-        return image_prompts
+        return self._store_image_prompts(image_prompts, scene_units)
 
     def _get_target_prompt_count(self) -> int:
         """
