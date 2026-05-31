@@ -11,7 +11,26 @@ from config import (
     get_ollama_base_url,
     get_openai_api_key,
     get_openai_base_url,
+    get_openai_reasoning_effort,
 )
+
+# Model name prefixes that reason before answering (output tokens include
+# hidden reasoning, and they accept a `reasoning.effort` parameter).
+_OPENAI_REASONING_PREFIXES = ("gpt-5", "o1", "o3", "o4")
+
+
+def _is_openai_reasoning_model(model: str) -> bool:
+    """
+    Returns True if the model is an OpenAI reasoning model.
+
+    Args:
+        model (str): model id
+
+    Returns:
+        is_reasoning (bool)
+    """
+    name = str(model or "").strip().lower()
+    return any(name.startswith(prefix) for prefix in _OPENAI_REASONING_PREFIXES)
 
 _selected_model: str | None = None
 _selected_provider: str | None = None
@@ -300,6 +319,11 @@ def generate_text_result(
         if cache_key:
             # Improves cache hit-rate routing for repeated instruction prefixes.
             payload["prompt_cache_key"] = str(cache_key)
+        if _is_openai_reasoning_model(model):
+            # Reduce hidden-reasoning token spend on short, structured tasks.
+            effort = get_openai_reasoning_effort()
+            if effort:
+                payload["reasoning"] = {"effort": effort}
 
         response = _openai_request("POST", "responses", payload)
         return {

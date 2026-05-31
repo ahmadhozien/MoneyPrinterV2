@@ -167,14 +167,15 @@
   "script_sentence_length": 4,
   "llm_max_retries": 2,
   "llm_prompt_caching_enabled": true,
+  "openai_reasoning_effort": "minimal",
   "llm_max_output_tokens": {
-    "topic": 80,
-    "script": 700,
-    "metadata": 500,
-    "prompts": 900,
-    "combined": 1200,
-    "translate": 700,
-    "stock_query": 700
+    "topic": 0,
+    "script": 0,
+    "metadata": 0,
+    "prompts": 0,
+    "combined": 0,
+    "translate": 0,
+    "stock_query": 0
   },
   "youtube_combine_metadata_and_prompts": true,
   "youtube_send_full_script_to_prompts": false,

@@ -996,14 +996,17 @@ def get_llm_max_output_tokens() -> dict:
     Returns:
         caps (dict): call-kind -> max output tokens
     """
+    # Default to 0 (no cap): reasoning models (gpt-5, o-series) spend output
+    # tokens on hidden reasoning, so a low cap can starve the visible answer.
+    # Set non-zero caps only for non-reasoning models.
     defaults = {
-        "topic": 80,
-        "script": 700,
-        "metadata": 500,
-        "prompts": 900,
-        "combined": 1200,
-        "translate": 700,
-        "stock_query": 700,
+        "topic": 0,
+        "script": 0,
+        "metadata": 0,
+        "prompts": 0,
+        "combined": 0,
+        "translate": 0,
+        "stock_query": 0,
     }
     raw = _read_config().get("llm_max_output_tokens", {})
     if isinstance(raw, dict):
@@ -1013,6 +1016,18 @@ def get_llm_max_output_tokens() -> dict:
             except (TypeError, ValueError):
                 continue
     return defaults
+
+def get_openai_reasoning_effort() -> str:
+    """
+    Reasoning effort for OpenAI reasoning models (gpt-5 / o-series). Lower
+    effort means fewer reasoning tokens (cheaper). One of: minimal, low,
+    medium, high. Empty string disables sending the parameter.
+
+    Returns:
+        effort (str): default "minimal"
+    """
+    value = str(_read_config().get("openai_reasoning_effort", "minimal")).strip().lower()
+    return value if value in {"", "minimal", "low", "medium", "high"} else "minimal"
 
 def get_youtube_combine_metadata_and_prompts() -> bool:
     """
