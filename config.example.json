@@ -52,6 +52,7 @@
   "openai_tts_voice": "onyx",
   "subtitle_font": "bold_font.ttf",
   "subtitle_mode": "word_by_word",
+  "subtitle_max_chunk_words": 5,
   "subtitle_font_english": "Oswald-VariableFont_wght.ttf",
   "subtitle_font_arabic": "Lalezar-Regular.ttf",
   "subtitle_font_size": 84,

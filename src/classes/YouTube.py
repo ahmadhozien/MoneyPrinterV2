@@ -6098,18 +6098,28 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             chunks (list[str]): subtitle text chunks
         """
         raw_parts = re.split(r"(?<=[\.\!\?؟،,:;])\s+|\n+", str(self.script or "").strip())
-        chunks = [part.strip(" \t\r\n-") for part in raw_parts if part.strip()]
+        sentence_parts = [part.strip(" \t\r\n-") for part in raw_parts if part.strip()]
 
-        if chunks:
-            return chunks
+        if not sentence_parts:
+            sentence_parts = [str(self.script or "").strip()]
 
-        fallback_words = str(self.script or "").split()
-        chunk_size = 6
-        return [
-            " ".join(fallback_words[index:index + chunk_size]).strip()
-            for index in range(0, len(fallback_words), chunk_size)
-            if " ".join(fallback_words[index:index + chunk_size]).strip()
-        ]
+        # Cap each subtitle to a few words so long (often Arabic) sentences don't
+        # fill the screen. 0 = no cap (split by sentence only).
+        max_words = get_subtitle_max_chunk_words()
+        chunks: list[str] = []
+        for part in sentence_parts:
+            words = part.split()
+            if not words:
+                continue
+            if max_words <= 0 or len(words) <= max_words:
+                chunks.append(part)
+                continue
+            for index in range(0, len(words), max_words):
+                piece = " ".join(words[index:index + max_words]).strip()
+                if piece:
+                    chunks.append(piece)
+
+        return chunks
 
     def _split_script_into_subtitle_words(self) -> list[str]:
         """

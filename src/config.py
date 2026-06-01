@@ -724,6 +724,21 @@ def get_subtitle_mode() -> str:
     with open(os.path.join(ROOT_DIR, "config.json"), "r", encoding="utf-8") as file:
         return json.load(file).get("subtitle_mode", "word_by_word").strip().lower() or "word_by_word"
 
+def get_subtitle_max_chunk_words() -> int:
+    """
+    Maximum number of words shown per subtitle in "chunk" mode. Long sentences
+    are split into pieces of at most this many words so the screen isn't
+    flooded with text. 0 disables the cap (split by sentence only).
+
+    Returns:
+        max_words (int): default 5
+    """
+    value = _read_config().get("subtitle_max_chunk_words", 5)
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return 5
+
 def get_subtitle_font_size() -> int:
     """
     Gets the subtitle font size.
