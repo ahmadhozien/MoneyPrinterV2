@@ -1766,9 +1766,9 @@ def render_config_tab() -> None:
                     st.number_input(
                         "Max AI visual assets",
                         min_value=0,
-                        max_value=12,
+                        max_value=60,
                         step=1,
-                        value=max(0, as_int(config.get("max_ai_assets", 2), 2)),
+                        value=min(60, max(0, as_int(config.get("max_ai_assets", 2), 2))),
                         help="Used by the mixed strategy to limit how many AI-generated images are allowed per video.",
                     )
                 )
