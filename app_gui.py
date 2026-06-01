@@ -2833,6 +2833,11 @@ def render_youtube_studio() -> None:
                             st.code(traceback.format_exc())
 
     with preview_tab:
+        # Re-read session state here: the Create-tab handlers run earlier in this
+        # same script run and may have just set the preview, so the values
+        # captured at the top of the function would be stale.
+        preview = st.session_state.get("youtube_preview", {})
+        generated = st.session_state.get("youtube_generated_video", {})
         preview_payload = preview if preview.get("account_id") == account["id"] else {}
         generated_payload = generated if generated.get("account_id") == account["id"] else {}
         preview_source_payload = preview_payload or generated_payload
