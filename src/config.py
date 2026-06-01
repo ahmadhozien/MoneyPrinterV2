@@ -1068,6 +1068,33 @@ def get_trends_region() -> str:
     """
     return str(_read_config().get("trends_region", "US") or "US").strip()
 
+def get_reddit_client_id() -> str:
+    """
+    Reddit app client ID for authenticated trend reads (oauth.reddit.com).
+    Reddit blocks unauthenticated JSON from many IPs, so this is recommended.
+    Falls back to the REDDIT_CLIENT_ID environment variable.
+
+    Returns:
+        client_id (str): the id, or "" if not configured
+    """
+    value = str(_read_config().get("reddit_client_id", "") or "").strip()
+    if not value:
+        value = os.environ.get("REDDIT_CLIENT_ID", "").strip()
+    return value
+
+def get_reddit_client_secret() -> str:
+    """
+    Reddit app client secret (paired with reddit_client_id). Falls back to the
+    REDDIT_CLIENT_SECRET environment variable.
+
+    Returns:
+        client_secret (str): the secret, or "" if not configured
+    """
+    value = str(_read_config().get("reddit_client_secret", "") or "").strip()
+    if not value:
+        value = os.environ.get("REDDIT_CLIENT_SECRET", "").strip()
+    return value
+
 def get_pixabay_query_use_main_llm() -> bool:
     """
     When True, stock-footage search queries are generated with the configured

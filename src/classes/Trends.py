@@ -15,7 +15,12 @@ from urllib import parse
 import re
 import requests
 
-from config import get_youtube_data_api_key, get_trends_region
+from config import (
+    get_reddit_client_id,
+    get_reddit_client_secret,
+    get_trends_region,
+    get_youtube_data_api_key,
+)
 
 # Reddit recommends a descriptive UA in the form platform:appid:version.
 USER_AGENT = "python:moneyprinterv2:1.0 (trend discovery)"
@@ -147,11 +152,39 @@ def _hours_since(epoch_seconds: float) -> float:
     return max(1.0, (now - float(epoch_seconds or 0)) / 3600.0)
 
 
+def _reddit_oauth_token() -> str:
+    """
+    Returns an app-only OAuth access token if Reddit credentials are configured.
+
+    Returns:
+        token (str): bearer token, or "" when unavailable
+    """
+    client_id = get_reddit_client_id()
+    client_secret = get_reddit_client_secret()
+    if not client_id or not client_secret:
+        return ""
+    try:
+        response = requests.post(
+            "https://www.reddit.com/api/v1/access_token",
+            auth=(client_id, client_secret),
+            data={"grant_type": "client_credentials"},
+            headers={"User-Agent": USER_AGENT},
+            timeout=10,
+        )
+        response.raise_for_status()
+        return str(response.json().get("access_token", "") or "")
+    except Exception:
+        return ""
+
+
 def fetch_reddit_trends(
     subreddits: list[str], limit: int = 15, time_filter: str = "week"
 ) -> tuple[list[dict], str]:
     """
-    Fetches top posts from the given subreddits via Reddit's public JSON.
+    Fetches top posts from the given subreddits. Uses Reddit's OAuth API
+    (oauth.reddit.com) when credentials are configured — recommended, since the
+    unauthenticated public JSON is blocked from many IPs — otherwise falls back
+    to the public JSON.
 
     Args:
         subreddits (list[str]): subreddit names (without r/)
@@ -164,16 +197,25 @@ def fetch_reddit_trends(
     ideas: list[dict] = []
     last_status = 0
     last_error = ""
+
+    token = _reddit_oauth_token()
+    authenticated = bool(token)
+    base_url = "https://oauth.reddit.com" if authenticated else "https://www.reddit.com"
+    headers = {"User-Agent": USER_AGENT}
+    if authenticated:
+        headers["Authorization"] = f"bearer {token}"
+
     for subreddit in subreddits:
         subreddit = str(subreddit or "").strip().lstrip("r/").strip("/")
         if not subreddit:
             continue
+        suffix = "top" if authenticated else "top.json"
         url = (
-            f"https://www.reddit.com/r/{parse.quote(subreddit)}/top.json"
+            f"{base_url}/r/{parse.quote(subreddit)}/{suffix}"
             f"?limit={int(limit)}&t={parse.quote(time_filter)}&raw_json=1"
         )
         try:
-            response = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=10)
+            response = requests.get(url, headers=headers, timeout=10)
             last_status = response.status_code
             response.raise_for_status()
             payload = response.json()
@@ -206,11 +248,15 @@ def fetch_reddit_trends(
     if not ideas:
         if last_status == 403:
             note = (
-                "Reddit returned 403 (blocked). This usually works from a normal home/office "
-                "network; cloud/VPN IPs are often blocked. If it persists, try again later."
+                "Reddit returned 403 (blocked). Reddit now blocks unauthenticated access from "
+                "most networks. Fix: create a free Reddit app (reddit.com/prefs/apps → 'script') "
+                "and set reddit_client_id / reddit_client_secret in config.json (or the "
+                "Reddit fields on the Config page)."
             )
         elif last_status == 429:
             note = "Reddit rate-limited the request (429). Wait a minute and try again."
+        elif authenticated and last_error:
+            note = f"Reddit (authenticated) fetch failed: {last_error}"
         elif last_error:
             note = f"Reddit fetch failed: {last_error}"
     return ideas, note

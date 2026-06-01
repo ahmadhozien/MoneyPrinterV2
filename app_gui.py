@@ -1829,6 +1829,17 @@ def render_config_tab() -> None:
                     value=config.get("trends_region", "US"),
                     help="ISO region for YouTube trends (e.g. US, EG, GB).",
                 )
+                config["reddit_client_id"] = st.text_input(
+                    "Reddit client ID (Trends)",
+                    value=config.get("reddit_client_id", ""),
+                    type="password",
+                    help="Reddit blocks unauthenticated access. Create a free app at reddit.com/prefs/apps (type 'script') and paste its client ID + secret here.",
+                )
+                config["reddit_client_secret"] = st.text_input(
+                    "Reddit client secret (Trends)",
+                    value=config.get("reddit_client_secret", ""),
+                    type="password",
+                )
 
         with video_tab:
             left, right = st.columns(2)
