@@ -20,7 +20,7 @@ if SRC_DIR not in sys.path:
 from cache import add_account, get_accounts, remove_account, update_account
 from classes.Tts import TTS
 from classes.TikTok import TikTok
-from classes.Trends import get_trending_ideas, list_trend_categories
+from classes.Trends import get_trending_ideas, language_to_code, list_trend_categories
 from classes.Twitter import Twitter
 from classes.YouTube import ImageRateLimitError, YouTube
 from config import ROOT_DIR as APP_ROOT_DIR
@@ -2899,12 +2899,25 @@ def render_youtube_studio() -> None:
             )
             custom_subreddits = [part.strip() for part in subs_raw.split(",") if part.strip()]
 
-        region = st.text_input(
-            "YouTube region code",
-            value=load_config().get("trends_region", "US"),
-            key=f"yt_trend_region_{account['id']}",
-            help="ISO code (US, EG, GB, ...). Used for YouTube trends only.",
-        )
+        region_col, mode_col = st.columns([1, 1.3])
+        with region_col:
+            region = st.text_input(
+                "YouTube region code",
+                value=load_config().get("trends_region", "US"),
+                key=f"yt_trend_region_{account['id']}",
+                help="ISO code (US, EG, GB, ...). Used for YouTube trends only.",
+            )
+        with mode_col:
+            youtube_mode_label = st.selectbox(
+                "YouTube mode",
+                options=["Trending in region", "Niche keyword search"],
+                index=0,
+                key=f"yt_trend_ytmode_{account['id']}",
+                help="'Trending in region' returns what's actually trending in that country (matches the region/language). 'Niche keyword search' finds recent popular videos for the category keywords.",
+            )
+        youtube_mode = "region" if youtube_mode_label == "Trending in region" else "search"
+        # Bias niche search toward the account's language (e.g. Arabic -> ar).
+        relevance_language = language_to_code(account.get("language", ""))
 
         if st.button("Fetch trending ideas", key=f"yt_trend_fetch_{account['id']}", type="primary"):
             sources = tuple(source.lower() for source in trend_sources) or ("reddit",)
@@ -2916,6 +2929,8 @@ def render_youtube_studio() -> None:
                         keywords=custom_keywords or None,
                         sources=sources,
                         region=region.strip() or None,
+                        language=relevance_language or None,
+                        youtube_mode=youtube_mode,
                     )
                     st.session_state[f"yt_trends_{account['id']}"] = {"ideas": ideas, "notes": notes}
                 except Exception as exc:
