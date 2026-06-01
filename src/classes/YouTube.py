@@ -4136,6 +4136,10 @@ class YouTube:
             "-y",
             "-v",
             "error",
+            # Loop the source so a clip shorter than the scene fills the whole
+            # duration instead of freezing on its last frame.
+            "-stream_loop",
+            "-1",
             "-i",
             asset_path,
             "-ss",
