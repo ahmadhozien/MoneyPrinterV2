@@ -1818,6 +1818,17 @@ def render_config_tab() -> None:
                     value=config.get("pixabay_api_key", ""),
                     type="password",
                 )
+                config["youtube_data_api_key"] = st.text_input(
+                    "YouTube Data API key (Trends)",
+                    value=config.get("youtube_data_api_key", ""),
+                    type="password",
+                    help="Enables YouTube trending in the Trends tab. Create one free at console.cloud.google.com → enable 'YouTube Data API v3'. Reddit trends work without a key.",
+                )
+                config["trends_region"] = st.text_input(
+                    "Trends region code",
+                    value=config.get("trends_region", "US"),
+                    help="ISO region for YouTube trends (e.g. US, EG, GB).",
+                )
 
         with video_tab:
             left, right = st.columns(2)
