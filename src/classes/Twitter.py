@@ -69,7 +69,10 @@ class Twitter:
 
             self._assert_profile_is_available(fp_profile_path)
 
-            # Set the profile path
+            # Set the profile path (force a fresh, isolated Firefox instance so
+            # we don't re-attach to an already-running browser/session).
+            self.options.add_argument("-no-remote")
+            self.options.add_argument("-new-instance")
             self.options.add_argument("-profile")
             self.options.add_argument(fp_profile_path)
 

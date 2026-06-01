@@ -286,6 +286,10 @@ def main():
                         if get_verbose():
                             info(" => Climbing Options Ladder...", False)
                         break
+
+                # Close the browser so switching accounts starts a fresh
+                # session instead of re-using this account's logged-in Firefox.
+                youtube.close()
     elif user_input == 2:
         info("Starting Twitter Bot...")
 

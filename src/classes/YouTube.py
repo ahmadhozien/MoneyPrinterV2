@@ -182,6 +182,12 @@ class YouTube:
 
             self._assert_profile_is_available(self._fp_profile_path)
 
+            # -no-remote / -new-instance force a fresh Firefox process bound to
+            # THIS profile. Without them, launching while another Firefox is
+            # open re-attaches to that running instance (and its logged-in
+            # account), so account switches silently use the wrong session.
+            self.options.add_argument("-no-remote")
+            self.options.add_argument("-new-instance")
             self.options.add_argument("-profile")
             self.options.add_argument(self._fp_profile_path)
 
@@ -192,6 +198,24 @@ class YouTube:
             self.browser = webdriver.Firefox(
                 service=self.service, options=self.options
             )
+
+    def close(self) -> None:
+        """
+        Closes the Selenium browser if one is open. Safe to call multiple times.
+        Call this when switching accounts so the next account opens its own
+        session instead of re-using this one.
+
+        Returns:
+            None
+        """
+        browser = getattr(self, "browser", None)
+        if browser is not None:
+            try:
+                browser.quit()
+            except Exception:
+                pass
+            finally:
+                self.browser = None
 
     def _assert_profile_is_available(self, profile_path: str) -> None:
         """
