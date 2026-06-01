@@ -2574,15 +2574,15 @@ def render_youtube_studio() -> None:
         with st.expander("Channel overrides", expanded=False):
             setup_col, context_col = st.columns([1, 1.2])
             with setup_col:
-                niche_override = st.text_input("Niche", value=account.get("niche", ""), key="yt_niche")
-                language_override = st.text_input("Language", value=account.get("language", "English"), key="yt_lang")
-                dialect_override = st.text_input("Dialect", value=account.get("dialect", ""), key="yt_dialect")
+                niche_override = st.text_input("Niche", value=account.get("niche", ""), key=f"yt_niche_{account['id']}")
+                language_override = st.text_input("Language", value=account.get("language", "English"), key=f"yt_lang_{account['id']}")
+                dialect_override = st.text_input("Dialect", value=account.get("dialect", ""), key=f"yt_dialect_{account['id']}")
             with context_col:
                 context_override = st.text_area(
                     "Character context",
                     value=account.get("character_context", ""),
                     height=140,
-                    key="yt_ctx",
+                    key=f"yt_ctx_{account['id']}",
                 )
 
         script_mode = st.radio(
@@ -3384,14 +3384,14 @@ def render_tiktok_studio() -> None:
     with st.expander("Channel overrides", expanded=False):
         ov_left, ov_right = st.columns([1, 1.2])
         with ov_left:
-            niche_override = st.text_input("Niche", value=account.get("niche", ""), key="tiktok_niche_override")
-            language_override = st.text_input("Language", value=account.get("language", "English"), key="tiktok_language_override")
-            dialect_override = st.text_input("Dialect", value=account.get("dialect", ""), key="tiktok_dialect_override")
+            niche_override = st.text_input("Niche", value=account.get("niche", ""), key=f"tiktok_niche_override_{account['id']}")
+            language_override = st.text_input("Language", value=account.get("language", "English"), key=f"tiktok_language_override_{account['id']}")
+            dialect_override = st.text_input("Dialect", value=account.get("dialect", ""), key=f"tiktok_dialect_override_{account['id']}")
         with ov_right:
             context_override = st.text_area(
                 "Character context",
                 value=account.get("character_context", ""),
-                key="tiktok_context_override",
+                key=f"tiktok_context_override_{account['id']}",
                 height=140,
             )
 
