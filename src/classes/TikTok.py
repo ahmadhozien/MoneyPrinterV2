@@ -75,10 +75,22 @@ class TikTok:
 
     def _assert_profile_is_available(self, profile_path: str) -> None:
         lock_path = os.path.join(profile_path, "parent.lock")
-        if os.path.exists(lock_path):
+        if not os.path.exists(lock_path):
+            return
+
+        # parent.lock often lingers after an unclean exit, so its presence does
+        # not mean Firefox is open. A live lock can't be renamed; a stale one can.
+        probe_path = lock_path + ".mpv2check"
+        try:
+            os.replace(lock_path, probe_path)
+        except OSError:
             raise RuntimeError(
                 "The selected Firefox profile is currently in use. Close Firefox completely and try again."
             )
+        try:
+            os.remove(probe_path)
+        except OSError:
+            pass
 
     def _get_caption_model_name(self) -> str | None:
         configured_model = get_youtube_metadata_model().strip()

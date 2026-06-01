@@ -243,10 +243,25 @@ class YouTube:
             None
         """
         lock_path = os.path.join(profile_path, "parent.lock")
-        if os.path.exists(lock_path):
+        if not os.path.exists(lock_path):
+            return
+
+        # parent.lock often lingers after an unclean exit (crash or an errored
+        # Selenium session), so its mere presence does NOT mean Firefox is open.
+        # A lock held by a running Firefox cannot be renamed/removed on Windows,
+        # while a stale one can — use that to tell them apart and clear stale ones.
+        probe_path = lock_path + ".mpv2check"
+        try:
+            os.replace(lock_path, probe_path)
+        except OSError:
             raise RuntimeError(
                 "The selected Firefox profile is currently in use. Close Firefox completely and try again."
             )
+        # Rename succeeded => the lock was stale. Remove it so Firefox can launch.
+        try:
+            os.remove(probe_path)
+        except OSError:
+            pass
 
     @property
     def niche(self) -> str:
