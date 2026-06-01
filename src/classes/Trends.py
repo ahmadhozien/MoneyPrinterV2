@@ -75,6 +75,22 @@ TREND_CATEGORIES: dict[str, dict] = {
 }
 
 
+# Map our niches to YouTube videoCategoryId for region-trending filtering.
+# Only categories with a sensible YouTube equivalent are listed; others fall
+# back to all-topic regional trending.
+YOUTUBE_CATEGORY_IDS = {
+    "Science & Space": "28",
+    "Tech & AI": "28",
+    "History & Mysteries": "27",
+    "Health & Fitness": "26",
+    "Psychology & Self-improvement": "27",
+    "Fun Facts / TIL": "27",
+    "Sports": "17",
+    "Gaming": "20",
+    "Movies & Pop culture": "24",
+}
+
+
 def list_trend_categories() -> list[str]:
     """Returns the suggested category names."""
     return list(TREND_CATEGORIES.keys())
@@ -272,14 +288,16 @@ def fetch_youtube_trends(
 
 
 def fetch_youtube_region_trending(
-    region: str = "US", limit: int = 20
+    region: str = "US", limit: int = 20, category_id: str | None = None
 ) -> tuple[list[dict], str]:
     """
-    Fetches the videos actually trending in a region via the mostPopular chart.
+    Fetches the videos actually trending in a region via the mostPopular chart,
+    optionally filtered to a YouTube video category.
 
     Args:
         region (str): ISO region code (e.g. EG)
         limit (int): max results
+        category_id (str | None): YouTube videoCategoryId to filter by
 
     Returns:
         (ideas, note) (tuple[list[dict], str])
@@ -288,20 +306,38 @@ def fetch_youtube_region_trending(
     if not api_key:
         return [], "YouTube source skipped: set youtube_data_api_key (or YOUTUBE_DATA_API_KEY) to enable it."
 
-    params = {
-        "part": "snippet,statistics",
-        "chart": "mostPopular",
-        "regionCode": region or "US",
-        "maxResults": str(min(int(limit), 50)),
-        "key": api_key,
-    }
-    url = "https://www.googleapis.com/youtube/v3/videos?" + parse.urlencode(params)
-    try:
+    extra_note = ""
+
+    def _request(use_category: bool):
+        params = {
+            "part": "snippet,statistics",
+            "chart": "mostPopular",
+            "regionCode": region or "US",
+            "maxResults": str(min(int(limit), 50)),
+            "key": api_key,
+        }
+        if use_category and category_id:
+            params["videoCategoryId"] = str(category_id)
+        url = "https://www.googleapis.com/youtube/v3/videos?" + parse.urlencode(params)
         response = requests.get(url, timeout=15)
         response.raise_for_status()
-        payload = response.json()
-    except Exception as exc:
-        return [], f"YouTube region-trending fetch failed: {exc}"
+        return response.json()
+
+    try:
+        payload = _request(use_category=True)
+    except Exception:
+        # Some regions reject category-filtered charts — fall back to all topics.
+        if category_id:
+            try:
+                payload = _request(use_category=False)
+                extra_note = (
+                    f"Category-filtered trending isn't available for region '{region or 'US'}'. "
+                    "Showing all-topic trending instead — use 'Niche keyword search' for category-specific ideas."
+                )
+            except Exception as exc:
+                return [], f"YouTube region-trending fetch failed: {exc}"
+        else:
+            return [], "YouTube region-trending fetch failed."
 
     ideas: list[dict] = []
     for item in payload.get("items", []):
@@ -321,7 +357,7 @@ def fetch_youtube_region_trending(
             }
         )
     ideas.sort(key=lambda idea: idea.get("velocity", 0), reverse=True)
-    return ideas, ""
+    return ideas, extra_note
 
 
 def get_trending_ideas(
@@ -367,7 +403,11 @@ def get_trending_ideas(
             notes.append(reddit_note)
     if "youtube" in sources:
         if youtube_mode == "region":
-            youtube_ideas, note = fetch_youtube_region_trending(region=region, limit=limit)
+            youtube_ideas, note = fetch_youtube_region_trending(
+                region=region,
+                limit=limit,
+                category_id=YOUTUBE_CATEGORY_IDS.get(category or ""),
+            )
         elif youtube_keywords:
             youtube_ideas, note = fetch_youtube_trends(
                 youtube_keywords, region=region, language=language

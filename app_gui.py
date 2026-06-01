@@ -2910,10 +2910,10 @@ def render_youtube_studio() -> None:
         with mode_col:
             youtube_mode_label = st.selectbox(
                 "YouTube mode",
-                options=["Trending in region", "Niche keyword search"],
+                options=["Niche keyword search", "Trending in region"],
                 index=0,
                 key=f"yt_trend_ytmode_{account['id']}",
-                help="'Trending in region' returns what's actually trending in that country (matches the region/language). 'Niche keyword search' finds recent popular videos for the category keywords.",
+                help="'Niche keyword search' respects the selected Category (recommended). 'Trending in region' returns what's trending in that country — it only filters by Category when YouTube has a matching one, otherwise all topics.",
             )
         youtube_mode = "region" if youtube_mode_label == "Trending in region" else "search"
         # Bias niche search toward the account's language (e.g. Arabic -> ar).
