@@ -176,3 +176,5 @@ These keys reduce text-LLM token usage during video generation — most relevant
 | `youtube_send_full_script_to_prompts` | `false` | When `false`, only the per-scene beats are sent to the image-prompt call (fewer input tokens). Set `true` to also embed the full script for extra context. |
 | `youtube_template_topic` | `false` | When `true`, the topic is templated from the niche locally instead of via an LLM call. |
 | `youtube_local_tags` | `true` | Derives tags/hashtags locally from the script when the model omits them, avoiding extra LLM calls. |
+| `image_request_timeout` | `90` | HTTP timeout (seconds) for image-generation requests. Lower values fail fast when a provider hangs instead of blocking the run (Nano Banana previously waited 300s). |
+| `pixabay_query_use_main_llm` | `true` | Generate stock-footage search queries with the configured LLM provider (e.g. OpenAI) instead of forcing Ollama. Fixes inaccurate stock queries when Ollama is unavailable. |

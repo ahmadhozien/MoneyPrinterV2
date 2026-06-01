@@ -1017,6 +1017,31 @@ def get_llm_max_output_tokens() -> dict:
                 continue
     return defaults
 
+def get_image_request_timeout() -> int:
+    """
+    HTTP timeout (seconds) for image-generation API requests. Lower values
+    fail fast when a provider hangs instead of blocking the whole run.
+
+    Returns:
+        timeout (int): seconds, default 90
+    """
+    value = _read_config().get("image_request_timeout", 90)
+    try:
+        return max(10, int(value))
+    except (TypeError, ValueError):
+        return 90
+
+def get_pixabay_query_use_main_llm() -> bool:
+    """
+    When True, stock-footage search queries are generated with the configured
+    LLM provider (e.g. OpenAI) instead of being forced through Ollama. This
+    fixes inaccurate stock queries when Ollama is unavailable.
+
+    Returns:
+        enabled (bool): default True
+    """
+    return bool(_read_config().get("pixabay_query_use_main_llm", True))
+
 def get_openai_reasoning_effort() -> str:
     """
     Reasoning effort for OpenAI reasoning models (gpt-5 / o-series). Lower

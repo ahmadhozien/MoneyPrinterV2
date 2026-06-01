@@ -88,6 +88,20 @@ def _is_retryable_rate_limit(response: requests.Response) -> bool:
     return response.status_code == 429
 
 
+def _is_retryable_server_error(response: requests.Response) -> bool:
+    """
+    Returns whether the response is a transient server error worth a quick
+    retry (e.g. Gemini 503 "overloaded").
+
+    Args:
+        response (requests.Response): provider response
+
+    Returns:
+        is_retryable (bool): True for 500/502/503/504
+    """
+    return response.status_code in (500, 502, 503, 504)
+
+
 def _nanobanana_response_has_no_image(body: dict) -> bool:
     """
     Returns whether Gemini/Nano Banana responded successfully but did not
@@ -2428,41 +2442,53 @@ class YouTube:
         if not cleaned_scene_payload:
             return fallback_queries
 
+        # Prefer the configured LLM provider (e.g. OpenAI) for accurate queries;
+        # fall back to Ollama only when explicitly disabled.
+        use_main_llm = get_pixabay_query_use_main_llm()
         ollama_model = str(get_ollama_model() or "").strip()
-        if not ollama_model:
+        if not use_main_llm and not ollama_model:
             return fallback_queries
+
+        instructions = (
+            "You generate Pixabay stock-footage search queries as JSON. "
+            "Return ONLY a JSON array with one object per scene, each with keys "
+            "scene_index, primary_q, fallback_q. primary_q and fallback_q are "
+            "Pixabay 'q' strings joined by '+'. Rules: English only; under 100 "
+            "characters each; prefer concrete people, place, object, clothing, "
+            "and action terms; never include cinematic/style words (vertical, "
+            "photorealistic, watermark, logo, text); never repeat locale "
+            "boilerplate (e.g. 'Egyptian setting', 'Arabic-speaking environment') "
+            "unless essential; keep queries stock-search friendly, not sentences."
+        )
+        prompt_body = (
+            f"Video subject: {self._strip_pixabay_query_boilerplate(self.subject)}\n"
+            f"Scenes JSON: {json.dumps(cleaned_scene_payload, ensure_ascii=False)}"
+        )
+        source_label = "llm" if use_main_llm else "ollama"
+        source_note = (
+            "Generated via LLM stock-query planner."
+            if use_main_llm
+            else "Generated via Ollama stock-query planner."
+        )
 
         last_error = ""
         for attempt in range(2):
             try:
-                completion = (
-                    str(
-                        self.generate_response_with_provider(
-                            (
-                                "Return only valid JSON.\n"
-                                "For each scene, create Pixabay search q values that are visually literal and compact.\n"
-                                "Rules:\n"
-                                "- English only.\n"
-                                "- Return an array with one object per scene.\n"
-                                "- Each object must include: scene_index, primary_q, fallback_q.\n"
-                                "- primary_q and fallback_q must be Pixabay q strings using + separators.\n"
-                                "- Each q must stay under 100 characters.\n"
-                                "- Prefer concrete people, place, object, clothing, and action terms.\n"
-                                "- Never include cinematic/style prompt words like vertical, photorealistic, watermark, logo, text.\n"
-                                "- Never repeat locale boilerplate like Egyptian setting or Arabic-speaking environment unless essential.\n"
-                                "- Keep queries stock-search friendly, not descriptive sentences.\n"
-                                f"Video subject: {self._strip_pixabay_query_boilerplate(self.subject)}\n"
-                                f"Scenes JSON: {json.dumps(cleaned_scene_payload, ensure_ascii=False)}"
-                            ),
-                            model_name=ollama_model,
-                            provider="ollama",
-                        )
+                if use_main_llm:
+                    raw = self.generate_response(
+                        prompt_body,
+                        model_name=self._get_metadata_model_name(),
+                        instructions=instructions,
+                        **self._llm_options("stock_query"),
                     )
-                    .replace("```json", "")
-                    .replace("```", "")
-                    .strip()
-                )
-                parsed = json.loads(completion)
+                else:
+                    raw = self.generate_response_with_provider(
+                        f"{instructions}\n{prompt_body}",
+                        model_name=ollama_model,
+                        provider="ollama",
+                    )
+
+                parsed = self._parse_json_lenient(raw)
                 applied_queries = 0
                 if isinstance(parsed, list):
                     for item in parsed:
@@ -2479,10 +2505,8 @@ class YouTube:
                         )
                         if primary_q:
                             fallback_queries[scene_index]["primary_q"] = primary_q
-                            fallback_queries[scene_index]["source"] = "ollama"
-                            fallback_queries[scene_index]["query_generation_note"] = (
-                                "Generated via Ollama stock-query planner."
-                            )
+                            fallback_queries[scene_index]["source"] = source_label
+                            fallback_queries[scene_index]["query_generation_note"] = source_note
                             applied_queries += 1
                         if fallback_q and fallback_q != primary_q:
                             fallback_queries[scene_index]["fallback_q"] = fallback_q
@@ -2490,9 +2514,9 @@ class YouTube:
                 if applied_queries > 0:
                     return fallback_queries
 
-                last_error = "Ollama returned no usable Pixabay q values."
+                last_error = "Stock-query planner returned no usable Pixabay q values."
             except Exception as exc:
-                last_error = str(exc).strip() or "Unknown Ollama query-generation error."
+                last_error = str(exc).strip() or "Unknown stock-query generation error."
 
             if attempt == 0:
                 time.sleep(0.4)
@@ -4722,7 +4746,7 @@ class YouTube:
                         endpoint,
                         headers={"x-goog-api-key": api_key, "Content-Type": "application/json"},
                         json=payload,
-                        timeout=300,
+                        timeout=get_image_request_timeout(),
                     )
 
                     if _is_retryable_rate_limit(response):
@@ -4740,6 +4764,17 @@ class YouTube:
                         )
                         warning(
                             f"Image API rate-limited. Waiting {wait_seconds}s before retry {attempt}/{IMAGE_RATE_LIMIT_RETRIES}."
+                        )
+                        time.sleep(wait_seconds)
+                        continue
+
+                    # Gemini frequently returns transient 503 "overloaded".
+                    # Retry quickly with backoff instead of failing the scene.
+                    if _is_retryable_server_error(response) and attempt <= IMAGE_RATE_LIMIT_RETRIES:
+                        wait_seconds = IMAGE_RATE_LIMIT_BACKOFF_SECONDS * attempt
+                        warning(
+                            f"Image API unavailable ({response.status_code}). "
+                            f"Waiting {wait_seconds}s before retry {attempt}/{IMAGE_RATE_LIMIT_RETRIES}."
                         )
                         time.sleep(wait_seconds)
                         continue
@@ -4879,7 +4914,7 @@ class YouTube:
                         "Content-Type": "application/json",
                     },
                     json=payload,
-                    timeout=300,
+                    timeout=get_image_request_timeout(),
                 )
 
                 if _is_retryable_rate_limit(response):
@@ -4967,7 +5002,7 @@ class YouTube:
                         "X-Title": "MoneyPrinterV2",
                     },
                     json=payload,
-                    timeout=300,
+                    timeout=get_image_request_timeout(),
                 )
 
                 if _is_retryable_rate_limit(response):
@@ -5033,7 +5068,7 @@ class YouTube:
                 image_bytes = self._decode_data_url_image(image_url)
 
                 if image_bytes is None and image_url:
-                    downloaded = requests.get(image_url, timeout=300)
+                    downloaded = requests.get(image_url, timeout=get_image_request_timeout())
                     downloaded.raise_for_status()
                     image_bytes = downloaded.content
 

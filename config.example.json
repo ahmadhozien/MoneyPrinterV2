@@ -168,6 +168,8 @@
   "llm_max_retries": 2,
   "llm_prompt_caching_enabled": true,
   "openai_reasoning_effort": "minimal",
+  "image_request_timeout": 90,
+  "pixabay_query_use_main_llm": true,
   "llm_max_output_tokens": {
     "topic": 0,
     "script": 0,
