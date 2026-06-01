@@ -43,13 +43,15 @@ def save_config(config: dict) -> None:
         json.dump(config, file, indent=2, ensure_ascii=False)
 
 
-def _send_trend_to_seed(seed_key: str, title: str) -> None:
+def _send_trend_to_seed(account_id: str, title: str) -> None:
     """
-    Button callback: prefill the Create tab's title/keyword seed with a chosen
-    trending idea. Runs before widgets re-instantiate, so setting the widget
-    key here is safe.
+    Button callback: apply a chosen trending idea to the Create tab. Sets both
+    the title/keyword seed and the Niche channel-override so the generated video
+    is built around the trend. Runs before widgets re-instantiate, so setting
+    the widget keys here is safe.
     """
-    st.session_state[seed_key] = title
+    st.session_state[f"youtube_seed_topic_{account_id}"] = title
+    st.session_state[f"yt_niche_{account_id}"] = title
     st.session_state["_trend_seed_notice"] = title
 
 
@@ -2875,7 +2877,7 @@ def render_youtube_studio() -> None:
 
         notice = st.session_state.pop("_trend_seed_notice", "")
         if notice:
-            st.success(f"Sent to Create tab as the title seed: “{notice}”. Open **Create** and click **Generate Full Video**.")
+            st.success(f"Applied to Create tab (title seed + Niche override): “{notice}”. Open **Create** and click **Generate Full Video**.")
 
         category_options = ["Custom"] + list_trend_categories()
         trend_col1, trend_col2 = st.columns([1.4, 1])
@@ -2953,7 +2955,6 @@ def render_youtube_studio() -> None:
             st.info(note)
 
         ideas = trend_state.get("ideas", [])
-        seed_key = f"youtube_seed_topic_{account['id']}"
         if ideas:
             st.write(f"**{len(ideas)} ideas** — click *Use as title* to seed the Create tab:")
             for index, idea in enumerate(ideas):
@@ -2966,7 +2967,7 @@ def render_youtube_studio() -> None:
                         "Use as title",
                         key=f"yt_trend_use_{account['id']}_{index}",
                         on_click=_send_trend_to_seed,
-                        args=(seed_key, idea["title"]),
+                        args=(account["id"], idea["title"]),
                     )
         elif trend_state:
             st.warning("No ideas found. Try another category, add the YouTube source, or use Custom subreddits.")
