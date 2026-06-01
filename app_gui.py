@@ -2593,6 +2593,7 @@ def render_youtube_studio() -> None:
         )
         manual_subject = ""
         manual_script = ""
+        seed_topic = ""
         if script_mode == "Write manually":
             manual_subject = st.text_input(
                 "Topic / angle (optional)",
@@ -2604,6 +2605,12 @@ def render_youtube_studio() -> None:
                 key=f"youtube_manual_script_{account['id']}",
                 height=200,
                 help="Paste narration. The app generates metadata, images, TTS, and the final video around it.",
+            )
+        else:
+            seed_topic = st.text_input(
+                "Title / keyword (optional)",
+                key=f"youtube_seed_topic_{account['id']}",
+                help="Give a title or keyword and the video is generated around it. Leave empty to auto-pick a topic from the niche.",
             )
 
         col1, col2, col3 = st.columns([1, 1.5, 1])
@@ -2629,7 +2636,7 @@ def render_youtube_studio() -> None:
                     subject = youtube.subject
                     script = youtube.script
                 else:
-                    subject = youtube.generate_topic()
+                    subject = youtube.generate_topic(seed_topic=seed_topic)
                     script = youtube.generate_script()
                 metadata = youtube.generate_metadata()
                 image_prompts = youtube.generate_prompts()
@@ -2670,7 +2677,7 @@ def render_youtube_studio() -> None:
                             raise RuntimeError("Enter the manual script first.")
                         youtube.generate_video_from_existing_script(TTS(), manual_script, manual_subject)
                     else:
-                        youtube.generate_video(TTS())
+                        youtube.generate_video(TTS(), seed_topic=seed_topic)
                 log_capture.flush()
 
                 st.session_state["youtube_preview"] = {
@@ -3403,6 +3410,7 @@ def render_tiktok_studio() -> None:
     )
     manual_subject = ""
     manual_script = ""
+    seed_topic = ""
     if script_mode == "Write manually":
         manual_subject = st.text_input(
             "Topic / angle (optional)",
@@ -3413,6 +3421,12 @@ def render_tiktok_studio() -> None:
             "Video script",
             key=f"tiktok_manual_script_{account['id']}",
             height=200,
+        )
+    else:
+        seed_topic = st.text_input(
+            "Title / keyword (optional)",
+            key=f"tiktok_seed_topic_{account['id']}",
+            help="Give a title or keyword and the video is generated around it. Leave empty to auto-pick a topic from the niche.",
         )
 
     render_kv_card(
@@ -3467,7 +3481,7 @@ def render_tiktok_studio() -> None:
                     subject = youtube.subject
                     script = youtube.script
                 else:
-                    subject = youtube.generate_topic()
+                    subject = youtube.generate_topic(seed_topic=seed_topic)
                     script = youtube.generate_script()
                 metadata = youtube.generate_metadata()
                 st.session_state[preview_state_key] = {
@@ -3506,7 +3520,7 @@ def render_tiktok_studio() -> None:
                             raise RuntimeError("Enter the manual script first.")
                         youtube.generate_video_from_existing_script(TTS(), manual_script, manual_subject)
                     else:
-                        youtube.generate_video(TTS())
+                        youtube.generate_video(TTS(), seed_topic=seed_topic)
 
                 st.session_state[generated_state_key] = {
                     "account_id": account["id"],

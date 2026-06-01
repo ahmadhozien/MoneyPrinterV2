@@ -1118,14 +1118,23 @@ class YouTube:
         # Reuse the niche as a concise, specific topic sentence.
         return niche if niche.endswith((".", "!", "?")) else f"{niche}."
 
-    def generate_topic(self) -> str:
+    def generate_topic(self, seed_topic: str = "") -> str:
         """
-        Generates a topic based on the YouTube Channel niche.
+        Generates a topic for the video.
+
+        Args:
+            seed_topic (str): Optional title/keyword to base the video on. When
+                provided it is used as the subject directly (no LLM call), so
+                the script and visuals are built around the given title.
 
         Returns:
-            topic (str): The generated topic.
+            topic (str): The generated (or seeded) topic.
         """
-        if get_youtube_template_topic():
+        seed_topic = str(seed_topic or "").strip()
+        if seed_topic:
+            # User supplied a title/keyword — build the video around it as-is.
+            completion = seed_topic
+        elif get_youtube_template_topic():
             # Skip the LLM entirely: derive a topic from the niche locally.
             completion = self._template_topic_from_niche()
         else:
@@ -6789,18 +6798,20 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
         return path
 
-    def generate_video(self, tts_instance: TTS) -> str:
+    def generate_video(self, tts_instance: TTS, seed_topic: str = "") -> str:
         """
         Generates a YouTube Short based on the provided niche and language.
 
         Args:
             tts_instance (TTS): Instance of TTS Class.
+            seed_topic (str): Optional title/keyword to base the video on. When
+                provided, it is used as the topic instead of generating one.
 
         Returns:
             path (str): The path to the generated MP4 File.
         """
-        # Generate the Topic
-        self.generate_topic()
+        # Generate the Topic (or use the supplied title/keyword)
+        self.generate_topic(seed_topic=seed_topic)
 
         # Generate the Script
         self.generate_script()
