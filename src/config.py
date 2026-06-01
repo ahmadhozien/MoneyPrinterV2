@@ -1046,6 +1046,28 @@ def get_image_request_timeout() -> int:
     except (TypeError, ValueError):
         return 90
 
+def get_youtube_data_api_key() -> str:
+    """
+    YouTube Data API key used for trend discovery (trending search). Falls back
+    to the YOUTUBE_DATA_API_KEY environment variable.
+
+    Returns:
+        api_key (str): the key, or "" if not configured
+    """
+    key = str(_read_config().get("youtube_data_api_key", "") or "").strip()
+    if not key:
+        key = os.environ.get("YOUTUBE_DATA_API_KEY", "").strip()
+    return key
+
+def get_trends_region() -> str:
+    """
+    Default ISO region code for YouTube trend discovery (e.g. US, EG).
+
+    Returns:
+        region (str): region code, default "US"
+    """
+    return str(_read_config().get("trends_region", "US") or "US").strip()
+
 def get_pixabay_query_use_main_llm() -> bool:
     """
     When True, stock-footage search queries are generated with the configured

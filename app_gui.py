@@ -20,6 +20,7 @@ if SRC_DIR not in sys.path:
 from cache import add_account, get_accounts, remove_account, update_account
 from classes.Tts import TTS
 from classes.TikTok import TikTok
+from classes.Trends import get_trending_ideas, list_trend_categories
 from classes.Twitter import Twitter
 from classes.YouTube import ImageRateLimitError, YouTube
 from config import ROOT_DIR as APP_ROOT_DIR
@@ -40,6 +41,16 @@ def load_config() -> dict:
 def save_config(config: dict) -> None:
     with open(CONFIG_PATH, "w", encoding="utf-8") as file:
         json.dump(config, file, indent=2, ensure_ascii=False)
+
+
+def _send_trend_to_seed(seed_key: str, title: str) -> None:
+    """
+    Button callback: prefill the Create tab's title/keyword seed with a chosen
+    trending idea. Runs before widgets re-instantiate, so setting the widget
+    key here is safe.
+    """
+    st.session_state[seed_key] = title
+    st.session_state["_trend_seed_notice"] = title
 
 
 def load_youtube_drafts() -> dict:
@@ -2567,7 +2578,9 @@ def render_youtube_studio() -> None:
     with stat3:
         st.metric("Recovery", len(recoverable_runs))
 
-    create_tab, preview_tab, drafts_tab, pricing_tab = st.tabs(["Create", "Preview", "Draft Library", "Pricing"])
+    create_tab, trends_tab, preview_tab, drafts_tab, pricing_tab = st.tabs(
+        ["Create", "Trends", "Preview", "Draft Library", "Pricing"]
+    )
 
     with create_tab:
         # Overrides in a compact expander — most users use defaults
@@ -2831,6 +2844,95 @@ def render_youtube_studio() -> None:
                         st.error(str(exc))
                         with st.expander("Technical details", expanded=False):
                             st.code(traceback.format_exc())
+
+    with trends_tab:
+        st.caption(
+            "Find trending / high-engagement titles, then send one to the Create tab as the "
+            "video seed. Reddit needs no key; YouTube needs `youtube_data_api_key` in config.json."
+        )
+
+        notice = st.session_state.pop("_trend_seed_notice", "")
+        if notice:
+            st.success(f"Sent to Create tab as the title seed: “{notice}”. Open **Create** and click **Generate Full Video**.")
+
+        category_options = ["Custom"] + list_trend_categories()
+        trend_col1, trend_col2 = st.columns([1.4, 1])
+        with trend_col1:
+            selected_category = st.selectbox(
+                "Category",
+                options=category_options,
+                index=1 if len(category_options) > 1 else 0,
+                key=f"yt_trend_category_{account['id']}",
+                help="Pick a suggested niche, or choose Custom to enter your own subreddits/keywords.",
+            )
+        with trend_col2:
+            trend_sources = st.multiselect(
+                "Sources",
+                options=["Reddit", "YouTube"],
+                default=["Reddit"],
+                key=f"yt_trend_sources_{account['id']}",
+            )
+
+        custom_subreddits: list[str] = []
+        custom_keywords = ""
+        if selected_category == "Custom":
+            subs_raw = st.text_input(
+                "Subreddits (comma-separated, without r/)",
+                key=f"yt_trend_subs_{account['id']}",
+                help="e.g. space, askscience, todayilearned",
+            )
+            custom_keywords = st.text_input(
+                "YouTube search keywords",
+                key=f"yt_trend_kw_{account['id']}",
+                help="e.g. space science facts",
+            )
+            custom_subreddits = [part.strip() for part in subs_raw.split(",") if part.strip()]
+
+        region = st.text_input(
+            "YouTube region code",
+            value=load_config().get("trends_region", "US"),
+            key=f"yt_trend_region_{account['id']}",
+            help="ISO code (US, EG, GB, ...). Used for YouTube trends only.",
+        )
+
+        if st.button("Fetch trending ideas", key=f"yt_trend_fetch_{account['id']}", type="primary"):
+            sources = tuple(source.lower() for source in trend_sources) or ("reddit",)
+            with st.spinner("Fetching trending ideas..."):
+                try:
+                    ideas, notes = get_trending_ideas(
+                        category=None if selected_category == "Custom" else selected_category,
+                        custom_subreddits=custom_subreddits or None,
+                        keywords=custom_keywords or None,
+                        sources=sources,
+                        region=region.strip() or None,
+                    )
+                    st.session_state[f"yt_trends_{account['id']}"] = {"ideas": ideas, "notes": notes}
+                except Exception as exc:
+                    st.error(str(exc))
+                    st.session_state[f"yt_trends_{account['id']}"] = {"ideas": [], "notes": []}
+
+        trend_state = st.session_state.get(f"yt_trends_{account['id']}", {})
+        for note in trend_state.get("notes", []):
+            st.info(note)
+
+        ideas = trend_state.get("ideas", [])
+        seed_key = f"youtube_seed_topic_{account['id']}"
+        if ideas:
+            st.write(f"**{len(ideas)} ideas** — click *Use as title* to seed the Create tab:")
+            for index, idea in enumerate(ideas):
+                idea_col, btn_col = st.columns([5, 1])
+                with idea_col:
+                    st.markdown(f"**{idea['title']}**")
+                    st.caption(f"{idea['source']} · {idea.get('metric_label', '')} · [open]({idea['url']})")
+                with btn_col:
+                    st.button(
+                        "Use as title",
+                        key=f"yt_trend_use_{account['id']}_{index}",
+                        on_click=_send_trend_to_seed,
+                        args=(seed_key, idea["title"]),
+                    )
+        elif trend_state:
+            st.warning("No ideas found. Try another category, add the YouTube source, or use Custom subreddits.")
 
     with preview_tab:
         # Re-read session state here: the Create-tab handlers run earlier in this
