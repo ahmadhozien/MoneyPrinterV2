@@ -7369,6 +7369,26 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
         return None
 
+    def _wait_for_button_by_text(self, labels, timeout_seconds: int = 8):
+        """
+        Polls for a visible button matching one of the labels until it appears
+        or the timeout elapses.
+
+        Args:
+            labels: iterable of candidate button labels
+            timeout_seconds (int): maximum wait time
+
+        Returns:
+            element: matching Selenium element or None
+        """
+        deadline = time.time() + timeout_seconds
+        while time.time() < deadline:
+            button = self._find_visible_button_by_text(*labels)
+            if button is not None:
+                return button
+            time.sleep(0.5)
+        return None
+
     def _content_checks_modal_is_open(self) -> bool:
         """
         Returns whether YouTube Studio is showing the content-check warning modal.
@@ -7547,9 +7567,9 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             )
 
             if not self._is_for_kids:
-                is_not_for_kids_checkbox.click()
+                self._click_element(is_not_for_kids_checkbox)
             else:
-                is_for_kids_checkbox.click()
+                self._click_element(is_for_kids_checkbox)
 
             time.sleep(0.5)
 
@@ -7581,9 +7601,9 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             )
             next_button.click()
 
-            # Set as unlisted
+            # Set visibility to Public (radios are Private[0], Unlisted[1], Public[2])
             if verbose:
-                info("\t=> Setting as unlisted...")
+                info("\t=> Setting visibility to Public...")
 
             wait.until(lambda drv: len(drv.find_elements(By.XPATH, YOUTUBE_RADIO_BUTTON_XPATH)) >= 3)
             radio_button = driver.find_elements(By.XPATH, YOUTUBE_RADIO_BUTTON_XPATH)
@@ -7602,16 +7622,18 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             )
             self._click_element(done_button)
 
-            if self._wait_for_content_checks_modal():
-                publish_anyway_button = self._find_visible_button_by_text("Publish anyway")
-                if publish_anyway_button is not None:
-                    if verbose:
-                        info("\t=> Content checks warning appeared. Publishing anyway because the upload is already saved.")
-                    self._click_element(publish_anyway_button)
-                else:
-                    raise RuntimeError(
-                        "YouTube showed the content-check warning modal, but the 'Publish anyway' button could not be found."
-                    )
+            # When the content checks are still running, YouTube opens a
+            # "Checks aren't finished — Publish anyway?" modal. Poll for the
+            # button directly (modal wording changes often, so don't rely on
+            # matching the modal text). If it never appears, the click above
+            # already published/saved the video.
+            publish_anyway_button = self._wait_for_button_by_text(
+                ("Publish anyway", "Publish now"), timeout_seconds=8
+            )
+            if publish_anyway_button is not None:
+                if verbose:
+                    info("\t=> Content-check modal appeared. Clicking 'Publish anyway'.")
+                self._click_element(publish_anyway_button)
 
             # Wait for 2 seconds
             time.sleep(2)
